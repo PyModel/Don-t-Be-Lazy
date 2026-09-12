@@ -337,6 +337,26 @@ check("request reconciliation keeps the focused solo cheap path", () => {
   return null;
 });
 
+check("the final report discloses remaining work, unrun checks, and hypotheses", () => {
+  const skill = read("SKILL.md");
+  const reference = read("references/reporting.md");
+  const template = read("templates/REPORT.md");
+  const hook = read("scripts/stop-hook.mjs");
+  const problems = [];
+  for (const phrase of ["not run", "unverified", "hypothesis:", "+N more", "templates/REPORT.md", "references/reporting.md"]) {
+    if (!skill.includes(phrase)) problems.push("SKILL.md lacks " + JSON.stringify(phrase));
+  }
+  for (const heading of ["## Unmet", "## Abandoned, deferred, or awaiting owner decision", "## Not started", "## Not run or unverified", "## Hypotheses", "## Assumptions"]) {
+    if (!template.includes(heading + "\n")) problems.push("templates/REPORT.md lacks " + JSON.stringify(heading));
+  }
+  for (const phrase of ["refuted:", "untested:", "REMOVED_BY_USER", "+N more"]) {
+    if (!reference.includes(phrase)) problems.push("references/reporting.md lacks " + JSON.stringify(phrase));
+  }
+  if (!hook.includes("never describe unmet gates as done")) problems.push("block reason omits the reporting rule");
+  if (!hook.includes("do not describe this task as done")) problems.push("release message omits the reporting rule");
+  return problems.length ? problems.join("; ") : null;
+});
+
 check("abandonment is terminal handoff rather than ALL MET", () => {
   const checker = read("scripts/gate-check.mjs");
   const hook = read("scripts/stop-hook.mjs");

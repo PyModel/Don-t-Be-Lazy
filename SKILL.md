@@ -81,9 +81,11 @@ node <skill-dir>/scripts/gate-lint.mjs GATES.md
 
 Fix every error it reports. Treat each warning as a prompt to sharpen the gate. Details are in the local `references/gates.md`.
 
-## Audit the final report
+## Report the full measured state
 
-Re-read the current request, reconcile it against the PLAN inventory when present, and re-measure every number and completion claim immediately before reporting. Use qualified ids such as `leaf-1.2.1:G3`. Report the measured met, unmet, and abandoned counts and surface every abandonment. Do not compose a done report while any required gate is unmet, abandoned, deferred, or awaiting an owner decision.
+Re-read the current request, reconcile it against the PLAN inventory when present, and re-measure every number and completion claim immediately before reporting: run `--status` (or `--reverify`) and copy its counts. Use qualified ids such as `leaf-1.2.1:G3`. Report the measured met, unmet, and abandoned counts and list every remaining item by id: unmet, abandoned, deferred, awaiting an owner decision, and not yet started. The list is as long as the work makes it; never shorten it with "+N more". Do not compose a done report while any required gate is unmet, abandoned, deferred, or awaiting an owner decision.
+
+Quote only output observed in this session. Report a command you did not run as `not run` with the reason, and mark a claim that rests on reading rather than running as `unverified`. Form hypotheses freely, but label each `hypothesis:` until a check in this session confirms it, then cite that check; report refuted hypotheses too. When any part of the task cannot be done, say so as soon as it is known, name the specific cause, record it as `ABANDON:`, `DEFERRED`, or `OWNER_DECISION`, and finish every part that does not depend on it. Write the report from the local `templates/REPORT.md` and follow the local `references/reporting.md`, especially for multi-session roadmaps where the per-phase state comes from ledgers, never from the plan.
 
 ## Install the optional Claude Code Stop hook carefully
 

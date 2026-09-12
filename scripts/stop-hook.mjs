@@ -198,7 +198,7 @@ const outstanding = [...invalid, ...unmet].map((item) => safeHostText(item));
 if (sessionState.blocks > MAX_BLOCKS) {
   allow("unlazy: releasing after " + MAX_BLOCKS + " blocks without gate progress" + where +
     "; " + outstanding.length + " item(s) remain (" + outstanding.slice(0, 4).join(", ") + ")." +
-    handoffMessage());
+    " Report every remaining item by id as unmet; do not describe this task as done." + handoffMessage());
 }
 
 const list = outstanding.slice(0, 5).join(", ") + (outstanding.length > 5 ? ", +" + (outstanding.length - 5) + " more" : "");
@@ -206,6 +206,7 @@ console.log(JSON.stringify({
   decision: "block",
   reason: "unlazy" + where + ": " + outstanding.length + " gate/ledger/dispatch item(s) need work: " + list +
     ". Run gate-check.mjs --status to inspect without execution. To run inherited CHECK lines, inspect them and use --approve. " +
-    "Use ABANDON: <id> <non-blank reason> only when a gate is genuinely impossible." + handoffMessage(),
+    "Use ABANDON: <id> <non-blank reason> only when a gate is genuinely impossible. " +
+    "Report only measured state: never describe unmet gates as done." + handoffMessage(),
 }));
 process.exit(0);

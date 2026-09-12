@@ -178,6 +178,7 @@ The unreleased `2.1.0` source integrates the useful parts of community PRs while
 - session-keyed Stop-hook state and atomic settings updates with a backup
 - Node 16 support, zero runtime dependencies, a package test command, and CI
 - accurate security, portability, research, and reproducibility documentation
+- a truthful-reporting contract (`references/reporting.md`, `templates/REPORT.md`): measured counts, every remaining item by id, `not run` and `unverified` labels, and checked hypotheses
 
 Contributor history and pull-request links are recorded in [CHANGELOG.md](CHANGELOG.md).
 

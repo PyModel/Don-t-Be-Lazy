@@ -4,6 +4,12 @@
 
 This section describes the current source tree. It does not claim that `2.1.0` has a Git tag or GitHub Release.
 
+### Truthful reporting
+
+- Add `references/reporting.md` and `templates/REPORT.md`: the final report copies counts from a `--status` or `--reverify` run taken immediately before writing, lists every unmet, abandoned, deferred, owner-decision, and not-started item by qualified id without "+N more", reports commands that did not run as `not run` and read-only claims as `unverified`, labels hypotheses until a check in the session confirms or refutes them, and names the specific cause when part of a task cannot be done while the rest is finished.
+- Make the Stop hook's block and six-block release messages state that only measured state may be reported and that unmet gates are never described as done.
+- Add a self-check that the skill, reference, template, and hook carry those disclosures.
+
 ### Gate authoring
 
 - Add `scripts/gate-lint.mjs`, a non-executing advisory audit of ledger quality. Warn on whole fixed-output commands, weak success vocabulary, shared-parser path ambiguity, activity titles, unmeasured manual numbers, and mostly manual ledgers without pretending to shell-parse chains or argv. Default warnings retain a `LINT OK` marker and exit `0`; `--strict` makes them fail. Reject unknown short and long options, bound ledger reads, refuse linked or special-file inputs, escape terminal, line-separator, and bidirectional controls, and cap fields plus reported finding count so escaping cannot amplify output without bound.
