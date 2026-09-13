@@ -6,9 +6,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { execFile, execFileSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { claimLeases, sha256 } from "../scripts/lib/gates.mjs";
+import { requireFifo, runNode, runSuite, skip } from "./lib/harness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DISPATCH_CHECK = join(HERE, "..", "scripts", "dispatch-check.mjs");
@@ -19,6 +21,7 @@ const tests = [];
 const MAX_STATE_BYTES = 8 * 1024 * 1024;
 const EMPTY_DISPATCH_STATE = JSON.stringify({ schema: 1, waves: {} }) + "\n";
 const REPLACEMENT_DISPATCH_STATE = '{ "schema": 1, "waves": {} }\n';
+const STATE_ROOT = mkdtempSync(join(tmpdir(), "unlazy-dispatch-state-"));
 
 const test = (name, fn) => tests.push({ name, fn });
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
@@ -40,25 +43,46 @@ function sandbox() {
   };
 }
 
+// Dispatch requires the scope's ledger and a claimed lease per leaf before a
+// wave opens. Each leaf ledger is already met so gate state never masks the
+// dispatch behavior under test.
+async function prepareLeaves(s, leaves, scope = "api", root = s.dir) {
+  const ledgerRoot = (relative, value) => {
+    const file = join(root, relative);
+    mkdirSync(dirname(file), { recursive: true });
+    if (!existsSync(file)) writeFileSync(file, value);
+  };
+  ledgerRoot(".unlazy/" + scope + "/GATES.md", "# Gates\n\n- [x] G1: complete\n  EVIDENCE: checked by test in fixture.md:1\n");
+  for (const leaf of leaves) {
+    ledgerRoot(".unlazy/" + scope + "/gates/" + leaf + ".md",
+      "OWNS: src/" + leaf + "/**\n\n# Gates: " + leaf + "\n\n- [x] G1: leaf output exists\n  EVIDENCE: checked src/" + leaf + "/index.mjs:1\n");
+    const claimed = await claimLeases(root, { scope, leaf, globs: ["src/" + leaf + "/**"] });
+    if (!claimed.ok && !(claimed.conflicts[0] && claimed.conflicts[0].identity)) {
+      throw new Error("fixture claim failed for " + leaf + ": " + JSON.stringify(claimed));
+    }
+  }
+}
+
 function runScript(script, args, options = {}) {
-  return new Promise((resolveResult) => {
-    const child = execFile(process.execPath, [...(options.nodeArgs || []), script, ...args], {
-      cwd: options.cwd,
-      encoding: "utf8",
-      env: options.env ? { ...process.env, ...options.env } : process.env,
-      maxBuffer: 1024 * 1024,
-      timeout: options.timeoutMs,
-    }, (error, stdout, stderr) => {
-      resolveResult({
-        code: error ? (error.code ?? 1) : 0,
-        out: (stdout || "") + (stderr || ""),
-      });
-    });
-    if (options.stdin !== undefined) child.stdin.end(options.stdin);
+  return runNode(script, args, {
+    ...options,
+    env: { UNLAZY_STATE_DIR: join(STATE_ROOT, basename(options.cwd || "none")), ...(options.env || {}) },
   });
 }
 
-const run = (args, options = {}) => runScript(DISPATCH_CHECK, args, options);
+// `open` needs its fixture (ledger plus one claimed lease per leaf) unless a
+// test sets `prepare: false` to exercise those refusals directly.
+async function run(args, options = {}) {
+  if (args[0] === "open" && options.prepare !== false) {
+    const value = (name) => { const index = args.indexOf(name); return index === -1 ? null : args[index + 1]; };
+    const scope = value("--scope");
+    const leaves = args.map((arg, index) => (args[index - 1] === "--leaf" ? arg : null)).filter(Boolean);
+    if (scope && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(scope) && leaves.every((leaf) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(leaf))) {
+      await prepareLeaves({ dir: value("--root") || options.cwd }, [...new Set(leaves)], scope, value("--root") || options.cwd);
+    }
+  }
+  return runScript(DISPATCH_CHECK, args, options);
+}
 
 function assertCommittedWarning(result) {
   assert(result.code === 0, "committed transition should exit 0\n" + result.out);
@@ -230,7 +254,7 @@ test("validation: malformed ids, handles, and state fail closed", async () => {
 });
 
 test("state file: symlinks are rejected without reading or changing the victim", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     s.write("victim.json", EMPTY_DISPATCH_STATE);
@@ -244,7 +268,7 @@ test("state file: symlinks are rejected without reading or changing the victim",
 });
 
 test("state file: a dangling symlink is invalid rather than missing", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     mkdirSync(join(s.dir, ".unlazy", "api"), { recursive: true });
@@ -286,7 +310,7 @@ test("state file: oversized input is rejected before JSON parsing", async () => 
 });
 
 test("state file: replacement during the read is rejected as unstable", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     const state = join(s.dir, ".unlazy", "api", "dispatch.json");
@@ -331,7 +355,7 @@ test("state file: replacement during the read is rejected as unstable", async ()
 });
 
 test("state file: a FIFO is rejected promptly without waiting for a writer", async () => {
-  if (process.platform === "win32") return;
+  requireFifo();
   const s = sandbox();
   try {
     const state = join(s.dir, ".unlazy", "api", "dispatch.json");
@@ -445,7 +469,7 @@ test("recovery: a failed native launch can be abandoned without a fabricated han
   } finally { s.cleanup(); }
 });
 
-test("hook: an abandoned wave does not re-block a new session", async () => {
+test("hook: an abandoned wave blocks a session once with its handoff, then allows Stop", async () => {
   const s = sandbox();
   try {
     s.write(".unlazy/api/GATES.md", "# Gates\n\n- [x] G1: complete\n  EVIDENCE: checked by test\n");
@@ -454,6 +478,11 @@ test("hook: an abandoned wave does not re-block a new session", async () => {
     await run([...base("abandon"), "--reason", "host rejected the second launch"], { cwd: s.dir });
 
     const stdin = JSON.stringify({ cwd: s.dir, session_id: "fresh-session" });
+    const first = await runScript(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    assertHas(first.out, '"decision":"block"');
+    assertHas(first.out, "HANDOFF REQUIRED");
+    assertHas(first.out, "dispatch:ready-1");
+    assert(!first.out.includes("host rejected"), "ledger-controlled reason leaked into privileged hook message");
     const hook = await runScript(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
     assert(!hook.out.includes('"decision":"block"'), "abandoned wave re-blocked Stop: " + hook.out);
     assertHas(hook.out, "HANDOFF REQUIRED");
@@ -531,32 +560,31 @@ test("hook: loop-guard release retains mixed abandonment handoff ids", async () 
   } finally { s.cleanup(); }
 });
 
-test("hook: malformed sibling session entries are discarded without fail-open", async () => {
+test("hook: malformed progress state fields are discarded without fail-open", async () => {
   const s = sandbox();
   try {
     s.write(".unlazy/api/GATES.md", "# Gates\n\n- [ ] G1: unfinished\n  EVIDENCE: pending\n");
-    s.write(".unlazy/api/hook-state.json", JSON.stringify({
-      schema: 1,
-      sessions: {
-        "000000000000000000000000": null,
-        "111111111111111111111111": "primitive",
-        "222222222222222222222222": { blocks: 3, updatedAt: "2026-08-24T10:00:00.000Z" },
-        "333333333333333333333333": { hash: "444444444444444444444444", blocks: -1, updatedAt: "2026-08-24T10:00:00.000Z" },
-      },
-    }) + "\n");
+    const stateFile = join(STATE_ROOT, basename(s.dir), "hook-state",
+      sha256("session\0valid-session").slice(0, 32) + ".json");
+    mkdirSync(dirname(stateFile), { recursive: true, mode: 0o700 });
+    writeFileSync(stateFile, JSON.stringify({
+      schema: 2,
+      session: { hash: 7, blocks: -1, notified: "not-a-list", baseline: { bad: null, "0123456789abcdef": { runnable: "x" } } },
+    }) + "\n", { mode: 0o600 });
     const result = await runScript(STOP_HOOK, ["--scope", "api"], {
       cwd: s.dir,
       stdin: JSON.stringify({ cwd: s.dir, session_id: "valid-session" }),
     });
     assertHas(result.out, '"decision":"block"');
-    assert(!result.out.includes("could not update"), result.out);
-    const state = JSON.parse(s.read(".unlazy/api/hook-state.json"));
-    assert(Object.values(state.sessions).every((entry) => entry && typeof entry === "object"), JSON.stringify(state));
+    assert(!result.out.includes("unavailable") && !result.out.includes("fell back"), result.out);
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(state.schema === 2 && state.session.blocks === 1 && Array.isArray(state.session.notified) &&
+      Object.keys(state.session.baseline).every((key) => /^[a-f0-9]{16}$/.test(key)), JSON.stringify(state));
   } finally { s.cleanup(); }
 });
 
 test("dispatch audit log: a symlink refusal warns after the state commit", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     s.write("victim.txt", "safe\n");
@@ -572,7 +600,7 @@ test("dispatch audit log: a symlink refusal warns after the state commit", async
 });
 
 test("dispatch audit log: committed warning sanitizes and bounds hostile path text", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     const root = join(
@@ -688,20 +716,6 @@ test("overlap: native starts precede waits and workers run simultaneously", asyn
   } finally { s.cleanup(); }
 });
 
-const selected = tests.filter(({ name }) => name.includes(filter));
-let passed = 0;
-const failures = [];
-
-for (const current of selected) {
-  try {
-    await current.fn();
-    passed += 1;
-    console.log("ok   " + current.name);
-  } catch (error) {
-    failures.push({ name: current.name, error });
-    console.log("FAIL " + current.name + "\n     " + String(error.message).split("\n").join("\n     "));
-  }
-}
-
-console.log("\n" + passed + "/" + selected.length + " passed");
-process.exit(failures.length ? 1 : 0);
+const exitCode = await runSuite(tests, { filter });
+rmSync(STATE_ROOT, { recursive: true, force: true });
+process.exit(exitCode);

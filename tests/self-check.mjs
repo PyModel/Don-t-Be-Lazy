@@ -10,9 +10,14 @@
 //
 // Prints "self-check ok (N/N)" on success, which is what the gate matches.
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cleanEnv } from "./lib/harness.mjs";
+import { approvalKey, approvalOracle } from "../scripts/lib/approval.mjs";
+import { planStructureProblems } from "../scripts/plan-check.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPTS = [
@@ -26,6 +31,11 @@ const SCRIPTS = [
   "scripts/lib/check-supervisor.mjs",
   "scripts/lib/process-tree.mjs",
   "scripts/lib/regex-worker.mjs",
+  "scripts/lib/approval.mjs",
+  "scripts/lib/terminal.mjs",
+  "scripts/plan-check.mjs",
+  "tests/lib/harness.mjs",
+  "tests/remediation-tests.mjs",
   "tests/run-tests.mjs",
   "tests/dispatch-tests.mjs",
   "tests/hardening-tests.mjs",
@@ -40,122 +50,6 @@ const SCRIPTS = [
 const read = (p) => readFileSync(join(ROOT, p), "utf8").replace(/\r\n/g, "\n");
 const checks = [];
 const check = (name, fn) => checks.push({ name, fn });
-
-function planStructureProblems(source) {
-  const problems = [];
-  const lines = source.split(/\r?\n/);
-  const section = (name) => {
-    const marker = "## " + name;
-    const starts = [];
-    for (let i = 0; i < lines.length; i++) if (lines[i].trim() === marker) starts.push(i);
-    if (starts.length !== 1) {
-      problems.push(marker + " occurs " + starts.length + " times");
-      return [];
-    }
-    let end = lines.length;
-    for (let i = starts[0] + 1; i < lines.length; i++) {
-      if (/^##\s+/.test(lines[i])) { end = i; break; }
-    }
-    return lines.slice(starts[0] + 1, end);
-  };
-  const cells = (line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return null;
-    return trimmed.slice(1, -1).split("|").map((cell) => cell.trim());
-  };
-
-  const table = section("Leaf dispatch table");
-  const headerIndex = table.findIndex((line) => /^\s*\|\s*Leaf\s*\|/.test(line));
-  const expectedHeader = ["Leaf", "Owns", "Needs", "Tier", "Planned wave", "State"];
-  const rows = [];
-  if (headerIndex < 0) {
-    problems.push("leaf dispatch table has no header");
-  } else {
-    const header = cells(table[headerIndex]);
-    if (JSON.stringify(header) !== JSON.stringify(expectedHeader)) {
-      problems.push("leaf dispatch header must be: " + expectedHeader.join(", "));
-    }
-    const separator = cells(table[headerIndex + 1] || "");
-    if (!separator || separator.length !== expectedHeader.length ||
-        separator.some((cell) => !/^:?-{3,}:?$/.test(cell))) {
-      problems.push("leaf dispatch table has an invalid separator");
-    }
-    for (let i = headerIndex + 2; i < table.length; i++) {
-      const row = cells(table[i]);
-      if (!row) {
-        if (rows.length && table[i].trim() === "") break;
-        continue;
-      }
-      rows.push(row);
-    }
-  }
-
-  const states = new Set(["WAITING", "READY", "IN-FLIGHT", "VERIFIED", "ABANDONED"]);
-  const tiers = new Set(["mechanical", "judgment"]);
-  const byId = new Map();
-  for (const row of rows) {
-    if (row.length !== expectedHeader.length) {
-      problems.push("leaf dispatch row has " + row.length + " cells: " + row.join(" | "));
-      continue;
-    }
-    const [id, owns, needsText, tier, waveText, state] = row;
-    if (!/^\d+(?:\.\d+)+$/.test(id)) problems.push("invalid leaf id: " + id);
-    if (byId.has(id)) problems.push("duplicate leaf row: " + id);
-    if (!owns || owns === "-") problems.push(id + " has no Owns paths");
-    if (!tiers.has(tier)) problems.push(id + " has invalid Tier: " + tier);
-    if (!/^[1-9]\d*$/.test(waveText)) problems.push(id + " has invalid Planned wave: " + waveText);
-    if (!states.has(state)) problems.push(id + " has invalid State: " + state);
-    const needs = needsText === "-" ? [] : needsText.split(",").map((value) => value.trim());
-    if (needs.some((value) => !/^\d+(?:\.\d+)+$/.test(value))) {
-      problems.push(id + " has invalid Needs: " + needsText);
-    }
-    byId.set(id, { needs, state, wave: Number(waveText) });
-  }
-  if (!rows.length) problems.push("leaf dispatch table has no rows");
-
-  for (const [id, row] of byId) {
-    let blocked = false;
-    for (const dependency of row.needs) {
-      const target = byId.get(dependency);
-      if (!target) {
-        problems.push(id + " needs unknown leaf " + dependency);
-        blocked = true;
-        continue;
-      }
-      if (dependency === id) problems.push(id + " depends on itself");
-      if (target.wave >= row.wave) problems.push(id + " is not planned after " + dependency);
-      if (target.state !== "VERIFIED") blocked = true;
-    }
-    if (row.state === "WAITING" && !blocked) problems.push(id + " is WAITING without a blocked dependency");
-    if (["READY", "IN-FLIGHT", "VERIFIED"].includes(row.state) && blocked) {
-      problems.push(id + " is " + row.state + " with a blocked dependency");
-    }
-  }
-
-  const tree = section("Tree");
-  const topologyLeaves = [];
-  for (const line of tree) {
-    if (!/^\s*-\s+\d/.test(line)) continue;
-    if (/\b(?:Owns|Needs|Tier|Wave|State)\b/i.test(line)) {
-      problems.push("tree repeats an operational field: " + line.trim());
-    }
-    const match = line.match(/^\s*-\s+(\d+(?:\.\d+)+)\s+<leaf>(?:\s|$)/);
-    if (match) topologyLeaves.push(match[1]);
-  }
-  const tableLeaves = [...byId.keys()].sort();
-  const treeLeaves = [...topologyLeaves].sort();
-  if (new Set(topologyLeaves).size !== topologyLeaves.length) problems.push("tree repeats a leaf id");
-  if (JSON.stringify(treeLeaves) !== JSON.stringify(tableLeaves)) {
-    problems.push("tree/table leaf sets differ: tree=" + treeLeaves.join(",") + " table=" + tableLeaves.join(","));
-  }
-
-  const scheduleHeadings = lines.filter((line) => line.trim() === "## Dispatch schedule").length;
-  if (scheduleHeadings) problems.push("separate dispatch schedule is forbidden");
-  if (lines.some((line) => /^\s*-\s*Wave\s+\d+/i.test(line))) {
-    problems.push("wave list duplicates Planned wave");
-  }
-  return problems;
-}
 
 function releasePrecedesPromotion(section, releaseToken, promoteToken) {
   const release = section.indexOf(releaseToken);
@@ -207,14 +101,26 @@ check("checks wait for close and cap output", () => {
   return null;
 });
 
-check("approval identity binds execution semantics", () => {
-  const src = read("scripts/gate-check.mjs");
-  const required = [
-    "check:", "expect:", "cwd", "shell", "timeoutMs", "maxOutputBytes",
-    "regexTimeoutMs", "regexStartupTimeoutMs", "maxRegexWorkers", "platform", "path:",
-  ];
-  const missing = required.filter(token => !src.includes(token));
-  return missing.length ? "approval oracle missing source tokens: " + missing.join(", ") : null;
+check("approval identity binds every execution input", () => {
+  // Behavior, not source text: change each oracle field in turn and require a
+  // different approval key.
+  const base = {
+    check: "node verify.mjs", expect: "/^ok$/m", cwd: "/repo", cwdIdentity: ["1", "2"],
+    ledgerDirectoryIdentity: ["1", "3"], shell: "/bin/sh", timeoutMs: 120000, maxOutputBytes: 1048576,
+    regexTimeoutMs: 250, regexStartupTimeoutMs: 5000, maxRegexWorkers: 4, platform: "linux",
+    path: "/usr/bin", inputs: [["verify.mjs", "a".repeat(64)]],
+  };
+  const key = approvalKey("/repo/GATES.md", "G1", approvalOracle(base));
+  const dropped = Object.keys(base).filter((field) => !(field in approvalOracle(base)));
+  if (dropped.length) return "approvalOracle drops: " + dropped.join(", ");
+  const mutate = (value) => typeof value === "number" ? value + 1 : Array.isArray(value) ? [...value, "x"] : value + "x";
+  const unbound = Object.keys(base).filter((field) =>
+    approvalKey("/repo/GATES.md", "G1", approvalOracle({ ...base, [field]: mutate(base[field]) })) === key);
+  if (unbound.length) return "changing these fields keeps the approval: " + unbound.join(", ");
+  if (approvalKey("/repo/other.md", "G1", approvalOracle(base)) === key) return "ledger path is unbound";
+  if (approvalKey("/repo/GATES.md", "G2", approvalOracle(base)) === key) return "gate id is unbound";
+  if (!read("scripts/gate-check.mjs").includes("approvalOracle(")) return "gate-check.mjs does not build approvals with approvalOracle";
+  return null;
 });
 
 check("the hook resolves a scope rather than globbing the tree", () => {
@@ -251,7 +157,7 @@ check("the PLAN template carries a revisioned contract denominator", () => {
 });
 
 check("the PLAN dispatch table is the single operational authority", () => {
-  const problems = planStructureProblems(read("templates/PLAN.md"));
+  const problems = planStructureProblems(read("templates/PLAN.md")).problems;
   return problems.length ? problems.join("; ") : null;
 });
 
@@ -283,7 +189,7 @@ check("the PLAN structural check rejects contradictory representations", () => {
   ];
   for (const [name, control] of controls) {
     if (control === plan) return "negative-control fixture no longer matches: " + name;
-    if (!planStructureProblems(control).length) return "negative control passed: " + name;
+    if (!planStructureProblems(control).problems.length) return "negative control passed: " + name;
   }
   return null;
 });
@@ -357,16 +263,195 @@ check("the final report discloses remaining work, unrun checks, and hypotheses",
   return problems.length ? problems.join("; ") : null;
 });
 
-check("abandonment is terminal handoff rather than ALL MET", () => {
-  const checker = read("scripts/gate-check.mjs");
-  const hook = read("scripts/stop-hook.mjs");
-  if (!checker.includes("HANDOFF REQUIRED") || !checker.includes("totalAbandoned === 0")) {
-    return "gate checker can still classify abandonment as completion";
+// Structure only: headings, pointers, and the table shape. The wording inside
+// each section is editorial and deliberately not pinned here.
+function engineeringStandardProblems({ skill, reference, economy, template }) {
+  const problems = [];
+  if (!skill.includes("`references/engineering-standard.md`")) problems.push("SKILL.md does not point to the engineering standard");
+  if (!economy.includes("`references/engineering-standard.md`")) problems.push("token economy does not point to the engineering standard");
+  for (const heading of [
+    "## Record a baseline before the first edit", "## Cover each boundary the change has",
+    "## Gate edge cases inside the contract", "## End the review rounds",
+    "## Check before an authorized commit", "## Record handoffs in the ledger", "## Audits and reviews",
+  ]) {
+    if (!reference.split("\n").includes(heading)) problems.push("references/engineering-standard.md lacks " + JSON.stringify(heading));
   }
-  if (!hook.includes("HANDOFF REQUIRED") || !hook.includes("handoffs")) {
-    return "Stop hook does not surface bounded abandonment handoff";
+  const header = reference.split("\n").find((line) => line.startsWith("| Row |"));
+  if (header !== "| Row | Applies when the change | Proving artifact |") problems.push("boundary table lost its artifact column");
+  if (!template.split("\n").includes("## Risks, trade-offs, and limits")) problems.push("templates/REPORT.md lacks a risk section");
+  return problems;
+}
+
+check("the engineering standard keeps its scoped, terminating structure", () => {
+  const sources = {
+    skill: read("SKILL.md"),
+    reference: read("references/engineering-standard.md"),
+    economy: read("references/token-economy.md"),
+    template: read("templates/REPORT.md"),
+  };
+  const problems = engineeringStandardProblems(sources);
+  if (problems.length) return problems.join("; ");
+  for (const [name, mutate] of [
+    ["missing review-round stop", (value) => ({ ...value, reference: value.reference.replace("## End the review rounds\n", "## Notes\n") })],
+    ["missing artifact column", (value) => ({ ...value, reference: value.reference.replace("| Proving artifact |", "| Notes |") })],
+    ["missing skill pointer", (value) => ({ ...value, skill: value.skill.split("`references/engineering-standard.md`").join("the standard") })],
+  ]) {
+    const control = mutate(sources);
+    if (JSON.stringify(control) === JSON.stringify(sources)) return "negative-control fixture no longer matches: " + name;
+    if (!engineeringStandardProblems(control).length) return "negative control passed: " + name;
   }
   return null;
+});
+
+// Every text file in the checkout, skipping version control, dependencies, and
+// local dot-directories such as .unlazy/ and .claude/.
+function repositoryTextFiles(directory = ROOT, prefix = "") {
+  const files = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.name === "node_modules" || (entry.name.startsWith(".") && entry.name !== ".github")) continue;
+    const path = prefix ? prefix + "/" + entry.name : entry.name;
+    if (entry.isDirectory()) files.push(...repositoryTextFiles(join(directory, entry.name), path));
+    else if (entry.isFile() && /\.(?:md|mjs|js|json|ya?ml|txt)$/.test(entry.name)) files.push(path);
+  }
+  return files;
+}
+
+check("repository text uses no dash-like punctuation", () => {
+  // U+2012 to U+2015 are the figure, en, em, and horizontal-bar dashes; U+2212
+  // is the minus sign that renders like one.
+  const DASH = /[\u2012-\u2015\u2212]/;
+  if (DASH.test("plain - hyphen")) return "negative control passed: hyphen flagged as dash";
+  for (const code of [0x2012, 0x2013, 0x2014, 0x2015, 0x2212]) {
+    if (!DASH.test("x" + String.fromCharCode(code) + "y")) return "negative control failed: U+" + code.toString(16) + " not detected";
+  }
+  const files = repositoryTextFiles();
+  if (!files.includes("SKILL.md") || !files.some((path) => path.startsWith("research/"))) {
+    return "file walk missed SKILL.md or research/: " + files.length + " files";
+  }
+  const dashed = files.filter((path) => DASH.test(read(path)));
+  return dashed.length ? "dash-like punctuation in: " + dashed.join(", ") : null;
+});
+
+check("no API newer than the Node 16.0 floor", () => {
+  // A grep cannot prove compatibility; CI runs the suite on Node 16.0.0 for
+  // that. This catches the common additions early and names them.
+  const NEWER = /\.at\(|Object\.hasOwn|structuredClone|findLast|util\.parseArgs|["']node:test["']|AbortSignal\.timeout|cpSync|toSorted|toReversed|Array\.fromAsync/;
+  if (!NEWER.test("list.at(-1)") || NEWER.test("const parseArgs = (argv) => argv")) return "API pattern negative control failed";
+  const bad = SCRIPTS.filter((path) => path !== "tests/self-check.mjs" && NEWER.test(read(path)));
+  return bad.length ? "post-16.0 API in: " + bad.join(", ") : null;
+});
+
+// Documented invocations must use flags and values the tools accept today. The
+// accepted flags come from each tool's own --help output, so a flag renamed in
+// code but not in prose fails here rather than in a reader's terminal.
+const TOOLS = ["gate-check", "gate-lint", "dispatch-check", "install-hooks", "plan-check"];
+const INVOCATION_RE = /node\s+"?([^\s"`]*\/)?scripts\/(gate-check|gate-lint|dispatch-check|install-hooks|plan-check)\.mjs"?([^`\n]*)/g;
+const METAVAR_VALUE = {
+  TOKENS: /^(?:<[^>]+>|[a-f0-9]{16}(?:,[a-f0-9]{16})*)$/,
+  N: /^(?:<[^>]+>|\d+)$/,
+  S: /^(?:<[^>]+>|\d+)$/,
+  IDS: /^(?:<[^>]+>|[A-Za-z0-9._-]+(?:,[A-Za-z0-9._-]+)*)$/,
+  ID: /^[A-Za-z0-9._<>-]+$/,
+  NAME: /^[A-Za-z0-9._<>-]+$/,
+};
+
+function toolHelp(tool) {
+  const result = spawnSync(process.execPath, [join(ROOT, "scripts", tool + ".mjs"), "--help"], { encoding: "utf8", env: cleanEnv() });
+  if (result.status !== 0) throw new Error(tool + " --help exited " + result.status + ": " + result.stderr);
+  const flags = new Set(result.stdout.match(/--[a-z][a-z-]*/g) || []);
+  const values = new Map();
+  for (const match of result.stdout.matchAll(/(--[a-z][a-z-]*)[ =]([A-Z][A-Z_]*)\b/g)) values.set(match[1], match[2]);
+  const subcommands = new Set([...result.stdout.matchAll(new RegExp(tool + "\\.mjs ([a-z]+) --", "g"))].map((match) => match[1]));
+  return { flags, values, subcommands };
+}
+
+function invocationProblems(text, helps) {
+  const problems = [];
+  let count = 0;
+  for (const [whole, prefix, tool, rest] of text.matchAll(INVOCATION_RE)) {
+    count++;
+    const shown = whole.trim();
+    if (prefix !== "<skill-dir>/") problems.push(shown + ": name the tool as <skill-dir>/scripts/" + tool + ".mjs");
+    const help = helps[tool];
+    const words = rest.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+    if (help.subcommands.size && !help.subcommands.has(words[0])) {
+      problems.push(shown + ": unknown subcommand " + JSON.stringify(words[0]));
+    }
+    for (let index = 0; index < words.length; index++) {
+      if (!words[index].startsWith("--")) continue;
+      const [name, ...inline] = words[index].split("=");
+      if (!help.flags.has(name)) {
+        problems.push(shown + ": " + tool + " has no " + name);
+        continue;
+      }
+      const metavar = help.values.get(name);
+      if (!metavar) {
+        if (inline.length) problems.push(shown + ": " + name + " takes no value");
+        continue;
+      }
+      const value = inline.length ? inline.join("=") : words[++index];
+      if (value === undefined || value.startsWith("--")) problems.push(shown + ": " + name + " needs " + metavar);
+      else if (METAVAR_VALUE[metavar] && !METAVAR_VALUE[metavar].test(value)) {
+        problems.push(shown + ": " + JSON.stringify(value) + " is not " + metavar + " for " + name);
+      }
+    }
+  }
+  return { problems, count };
+}
+
+const markdownIn = (directory) => readdirSync(join(ROOT, directory))
+  .filter((name) => name.endsWith(".md")).map((name) => directory + "/" + name);
+
+check("documented tool invocations use flags the tools accept", () => {
+  const helps = Object.fromEntries(TOOLS.map((tool) => [tool, toolHelp(tool)]));
+  for (const [name, text] of [
+    ["bare --approve", "`node <skill-dir>/scripts/gate-check.mjs --approve GATES.md`"],
+    ["unknown flag", "`node <skill-dir>/scripts/gate-lint.mjs --nope GATES.md`"],
+    ["repository-relative tool path", "`node scripts/gate-lint.mjs GATES.md`"],
+    ["other skill placeholder", "`node <path-to-skill>/scripts/gate-check.mjs --status GATES.md`"],
+    ["unknown subcommand", "`node <skill-dir>/scripts/dispatch-check.mjs launch --scope api --wave w1`"],
+    ["missing value", "`node <skill-dir>/scripts/gate-check.mjs --scope`"],
+  ]) {
+    if (!invocationProblems(text, helps).problems.length) return "negative control passed: " + name;
+  }
+  const accepted = invocationProblems("`node <skill-dir>/scripts/gate-check.mjs --approve=0123456789abcdef,fedcba9876543210 GATES.md`", helps);
+  if (accepted.problems.length || accepted.count !== 1) return "positive control failed: " + accepted.problems.join("; ");
+  let total = 0;
+  const problems = [];
+  for (const path of ["SKILL.md", "SECURITY.md", "README.md", "CONTRIBUTING.md", ...markdownIn("references"), ...markdownIn("templates")]) {
+    const result = invocationProblems(read(path), helps);
+    total += result.count;
+    problems.push(...result.problems.map((problem) => path + ": " + problem));
+  }
+  if (total < 20) return "found only " + total + " documented invocations; the pattern no longer matches the docs";
+  return problems.length ? problems.join("; ") : null;
+});
+
+check("abandonment is terminal handoff rather than ALL MET", () => {
+  // Behavior, not source text: run the real checker and hook on a ledger with
+  // one met gate and one deferred handoff.
+  const dir = mkdtempSync(join(tmpdir(), "unlazy-self-check-"));
+  try {
+    writeFileSync(join(dir, "GATES.md"), "# Gates\n\n- [x] G1: done\n  EVIDENCE: checked notes.md:1\n" +
+      "- [ ] G2: impossible\n  EVIDENCE: pending\n\nABANDON: G2 DEFERRED: needs the vendor API\n");
+    const env = cleanEnv({ UNLAZY_STATE_DIR: mkdtempSync(join(tmpdir(), "unlazy-self-check-state-")) });
+    const status = spawnSync(process.execPath, [join(ROOT, "scripts", "gate-check.mjs"), "--status"], { cwd: dir, encoding: "utf8", env });
+    if (status.status !== 1 || !status.stdout.includes("HANDOFF REQUIRED") || status.stdout.includes("ALL MET")) {
+      return "checker did not report a non-successful handoff: " + status.stdout + status.stderr;
+    }
+    if (!status.stdout.includes("GATES:G2 (DEFERRED)")) return "checker lost the handoff kind: " + status.stdout;
+    const hook = spawnSync(process.execPath, [join(ROOT, "scripts", "stop-hook.mjs")], {
+      cwd: dir, encoding: "utf8", env, input: JSON.stringify({ cwd: dir, session_id: "self-check" }),
+    });
+    rmSync(env.UNLAZY_STATE_DIR, { recursive: true, force: true });
+    if (!hook.stdout.includes('"decision":"block"') || !hook.stdout.includes("HANDOFF REQUIRED")) {
+      return "Stop hook did not deliver the handoff to the model: " + hook.stdout + hook.stderr;
+    }
+    if (hook.stdout.includes("vendor API")) return "Stop hook copied a free-form handoff reason";
+    return null;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 let passed = 0;

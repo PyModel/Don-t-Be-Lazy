@@ -16,8 +16,14 @@ Use `OPEN`, `VERIFIED`, or `ABANDONED` for branches. Store leaf ledgers as `gate
 
 ## Driver loop
 
-1. **Plan before fan-out.** Reread the original request and current amendments. Create `.unlazy/<scope>/PLAN.md`, `.unlazy/<scope>/GATES.md`, and one ledger per leaf and branch from the templates. Inventory every independently omittable outcome and acceptance-changing constraint with a stable id, owner, observing gate or manual review, disposition, and revision. Fix interfaces, naming, toolchain, dependencies, and exact ownership before dispatch.
-2. **Inspect and approve checks.** Run `gate-check --status` on every inherited ledger. Review each `CHECK:`, `EXPECT:`, and `CWD:`, including called scripts. Determine the shell and inherited `PATH`; a new oracle with no exact approval prints its resolved values during a normal run without executing. Use `--approve` only after inspection, and do not treat normal mode as a dry run once approval exists.
+1. **Plan before fan-out.** Reread the original request and current amendments. Create `.unlazy/<scope>/PLAN.md`, `.unlazy/<scope>/GATES.md`, and one ledger per leaf and branch from the templates. Inventory every independently omittable outcome and acceptance-changing constraint with a stable id, owner, observing gate or manual review, disposition, and revision. Fix interfaces, naming, toolchain, dependencies, and exact ownership before dispatch. Check the plan without executing anything:
+
+   ```text
+   node <skill-dir>/scripts/plan-check.mjs --require C1,C2,C3 .unlazy/<scope>/PLAN.md
+   ```
+
+   Pass the contract ids from your reread. Without `--require`, an omitted row cannot be detected.
+2. **Review and approve checks.** Run `gate-check --status` on every inherited ledger, then `gate-check --review` to print each oracle with its resolved directory, shell, `PATH` digest, bound input files, and token. Read each `CHECK:`, `EXPECT:`, and `CWD:`, including called scripts. Approve with `--approve=<tokens>`: the driver may approve oracles it wrote in this session, and an inherited ledger needs the user's approval. A plain run never executes an unapproved oracle and exits `4`, but it is not a dry run once approval exists.
 3. **Claim every concurrent leaf.** Run:
 
    ```text
@@ -25,14 +31,14 @@ Use `OPEN`, `VERIFIED`, or `ABANDONED` for branches. Store leaf ledgers as `gate
    ```
 
    A refused claim means the split is not safe for concurrent dispatch. Change the plan or run the work sequentially; never bypass the refusal.
-4. **Launch each ready wave.** Give each leaf only the shared contract, its exact ownership and dependencies, its own ledger, and the four-pass completion rule. Open a dispatch wave for the independent `READY` leaves, call the host's native nonblocking launch once per leaf, record every host handle, and seal the wave before the first wait or result read. Follow [dispatch.md](dispatch.md); do not leak unrelated leaf histories.
+4. **Launch each ready wave.** Give each leaf only the shared contract, its exact ownership and dependencies, its own ledger, the four-pass completion rule, and [engineering-standard.md](engineering-standard.md). A leaf on another host has not loaded `SKILL.md`, so the brief carries the standard, the approval rule, and the instruction to report any manual gate it certified as self-certified. Open a dispatch wave for the independent `READY` leaves, call the host's native nonblocking launch once per leaf, record every host handle, and seal the wave before the first wait or result read. Follow [dispatch.md](dispatch.md); do not leak unrelated leaf histories.
 5. **Verify each return independently.** Record the native return in its wave, then re-run the returned leaf's runnable gates, including already checked gates:
 
    ```text
    node <skill-dir>/scripts/gate-check.mjs --root . --cwd . --reverify .unlazy/<scope>/gates/leaf-1.2.1.md
    ```
 
-   `--status` alone is not re-verification. If an approved oracle changed, inspect it and approve the new oracle before continuing. Review manual gates directly and try to refute at least one passed gate.
+   `--status` alone is not re-verification. Exit `4` means an oracle or a named verifier changed: review it and approve the new token before continuing. Review manual gates directly and try to refute at least one passed gate.
 6. **Append status and roll forward.** Record the result without rewriting history:
 
    ```text
@@ -48,7 +54,7 @@ Use `OPEN`, `VERIFIED`, or `ABANDONED` for branches. Store leaf ledgers as `gate
 
    Only then promote newly unblocked leaves from `WAITING` to `READY` and dispatch them without waiting for unrelated in-flight leaves.
 7. **Integrate bottom-up.** Work each `node-*.md` ledger only after all named children return. Reverify the children, then run interface, end-to-end, and regression checks.
-8. **Reconcile, release, and report.** Reread the current request and review every current contract row. Missing/stale ownership or observation, abandonment, deferment, and owner decisions are non-completion. Release the whole scope only after every leaf has settled, every dispatch wave is terminal, branch and root ledgers have been reverified, and final aggregate verification has run. Scope-wide release before that point is reserved for explicit recovery after verifying the recorded owner is gone, never normal promotion. Report only when both the inventory and root ledger are met, then remeasure every reported count.
+8. **Reconcile, release, and report.** Reread the current request, rerun `plan-check.mjs --require` with the current ids, and review every current contract row. Missing or stale ownership or observation, abandonment, deferment, and owner decisions are non-completion. Release the whole scope only after every leaf has settled, every dispatch wave is terminal, branch and root ledgers have been reverified, and final aggregate verification has run. Scope-wide release before that point is reserved for explicit recovery after verifying the recorded owner is gone, never normal promotion. Report only when both the inventory and root ledger are met, then remeasure every reported count.
 
 ## Check concurrency
 
@@ -87,7 +93,7 @@ Do not invent a dependency during dispatch. Add it to `PLAN.md`, correct the aff
 1. **Leaf self-check:** catches ordinary incompleteness but remains self-certification.
 2. **Parent `--reverify`:** executes each runnable oracle again instead of trusting old or manually written evidence.
 3. **Branch integration:** catches locally correct children that do not compose.
-4. **Optional Stop hook:** blocks the driver from ending while its resolved pipeline has unmet ledgers or incomplete dispatch waves. It does not execute checks or validate their meaning.
+4. **Optional Stop hook, Claude Code only:** blocks the driver session from ending while its enforced pipeline has unmet ledgers or an unsealed dispatch wave. It does not execute checks or validate their meaning. It does not gate subagents, because unlazy installs no SubagentStop handler, so a leaf can stop with unmet gates; parent `--reverify` is the leaf's gate. Other hosts have only layers 1 to 3.
 
 The parent must use the same required toolchain and declared shell. If the environment differs, record and resolve the mismatch instead of accepting old evidence.
 
@@ -100,7 +106,7 @@ Automation cannot prove every user-facing or judgment-heavy outcome. For each ma
 - obtain independent review for high-risk outcomes when feasible
 - keep the gate unmet if evidence is ambiguous
 
-Do not call a leaf `VERIFIED` merely because every runnable gate passed.
+A leaf's manual evidence is self-certified until the parent reviews it. Record who reviewed each consequential manual gate. Do not call a leaf `VERIFIED` merely because every runnable gate passed.
 
 ## When not to orchestrate
 

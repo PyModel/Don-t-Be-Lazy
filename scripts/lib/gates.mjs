@@ -2,11 +2,12 @@
 // Zero dependencies. Node 16+.
 
 import {
-  closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync,
-  openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, statSync, unlinkSync,
-  writeFileSync,
+  closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync,
+  mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, statSync,
+  unlinkSync, writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const UNLAZY_DIR = ".unlazy";
@@ -18,15 +19,18 @@ export const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 export const sha256 = (value) => createHash("sha256").update(String(value)).digest("hex");
 
 const WINDOWS_TRANSIENT_FS_ERRORS = new Set(["EACCES", "EBUSY", "EPERM"]);
+const DIRECTORY_FSYNC_UNSUPPORTED = new Set(["EBADF", "EINVAL", "EISDIR", "ENOTSUP", "EPERM", "EACCES"]);
 const SYNC_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
 const DEFAULT_STABLE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const LEASE_MAX_BYTES = 64 * 1024;
+const LOCK_RECORD_MAX_BYTES = 4096;
+const CASE_INSENSITIVE_PATHS = process.platform === "win32" || process.platform === "darwin";
 
 function isTransientWindowsFsError(error) {
   return process.platform === "win32" && WINDOWS_TRANSIENT_FS_ERRORS.has(error && error.code);
 }
 
-function pathIsInside(parent, child) {
+export function pathIsInside(parent, child) {
   const rel = relative(resolve(parent), resolve(child));
   return rel === "" || (!rel.startsWith(".." + sep) && rel !== ".." && !isAbsolute(rel));
 }
@@ -49,6 +53,16 @@ function assertRegularSingleLink(info, target, label, maxBytes) {
   }
   if (info.size > maxBytes) {
     throw new Error(label + " exceeds " + maxBytes + " bytes: " + target);
+  }
+}
+
+export function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return Boolean(error && error.code === "EPERM");
   }
 }
 
@@ -119,7 +133,7 @@ export function statCurrentNamedFile(path, options = {}) {
 // symlink, blocking on a FIFO, accepting a hard link, or crossing an optional
 // canonical root. The descriptor and named entry must identify the same stable
 // file before and after the bounded read.
-export function readStableRegularFile(path, { root, maxBytes, label } = {}) {
+export function readStableRegularFile(path, { root, maxBytes, label, raw = false } = {}) {
   const target = resolve(path);
   const kind = String(label || "file");
   const limit = maxBytes === undefined ? DEFAULT_STABLE_FILE_MAX_BYTES : Number(maxBytes);
@@ -182,14 +196,15 @@ export function readStableRegularFile(path, { root, maxBytes, label } = {}) {
     if (canonicalAfter !== canonicalBefore || (canonicalRoot && !pathIsInside(canonicalRoot, canonicalAfter))) {
       throw new Error(kind + " changed canonical location while it was read: " + target);
     }
-    return Buffer.concat(chunks, total).toString("utf8");
+    const bytes = Buffer.concat(chunks, total);
+    return raw ? bytes : bytes.toString("utf8");
   } catch (error) {
     if (error && error.code === "ENOENT") {
       throw new Error(kind + " changed while it was read: " + target);
     }
     throw error;
   } finally {
-    if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
+    if (fd !== null) try { closeSync(fd); } catch { /* the read result is already decided */ }
   }
 }
 
@@ -233,6 +248,8 @@ function replaceAtomic(temp, target) {
   }
 }
 
+// ------------------------------------------------------------------ parser
+
 const GATE_RE = /^- \[( |x|X)\] (.*)$/;
 const ATTR_RE = /^(\s+)(CHECK|EXPECT|EVIDENCE|CWD):\s?(.*)$/;
 const UNINDENTED_ATTR_RE = /^(CHECK|EXPECT|EVIDENCE|CWD):\s?(.*)$/;
@@ -241,44 +258,85 @@ const INDENTED_ABANDON_RE = /^\s+ABANDON:/;
 const OWNS_RE = /^OWNS:\s*(.*)$/;
 const FENCE_OPEN_RE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
 const REGEX_RE = /^\/([\s\S]*)\/([a-z]*)$/;
+const VALID_REGEX_FLAGS_RE = /^(?!.*(.).*\1)[dgimsuyv]*$/;
 // A pattern author escapes an inner slash or has none. A literal path always
 // carries one, so an unescaped inner slash marks the ambiguous reading.
 const UNESCAPED_SLASH_RE = /(^|[^\\])\//;
 const SCOPE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// Characters a reader cannot see but the parser would. A lone CR or line
+// separator splits a line for some renderers and not for the parser; zero-width
+// and bidirectional controls make reviewed text differ from executed text.
+const HIDDEN_CHARACTER_RE = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b\u200c\u200e\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
+// Anything a Markdown reader would render as a task checkbox. A line of this
+// shape that fails the strict gate grammar must not silently become prose.
+const CHECKBOX_LIKE_RE = /^\s*(?:[-*+]|\d+[.)])\s*\[\s*[xX\u2713\u2714]?\s*\]/;
+const ATTRIBUTE_LOOKALIKE_RE = /^\s*(?:check|expect|evidence|cwd|abandon|owns)\s*:/i;
+const HANDOFF_KIND_RE = /^(DEFERRED|OWNER_DECISION):\s*(.*)$/;
+export const HANDOFF_KINDS = ["ABANDONED", "DEFERRED", "OWNER_DECISION"];
 
 function parseRegex(expect) {
   const match = String(expect).match(REGEX_RE);
   if (!match) return { kind: "text", value: String(expect) };
-  if (match[1].length > 1000) return { error: "EXPECT regex is longer than 1000 characters" };
+  const [, source, flags] = match;
+  if (source.length > 1000) return { error: "EXPECT regex is longer than 1000 characters" };
+  if (!VALID_REGEX_FLAGS_RE.test(flags) && UNESCAPED_SLASH_RE.test(source)) {
+    return {
+      error: "EXPECT " + JSON.stringify(expect) + " reads as /pattern/flags with invalid flags " +
+        JSON.stringify(flags) + "; it looks like a path, so drop the wrapping slashes to match a literal substring",
+    };
+  }
+  let compiled;
   try {
-    // Matching happens in a disposable worker so catastrophic backtracking
-    // cannot hang the checker.
-    new RegExp(match[1], match[2]);
+    // Output matching happens in a disposable worker so catastrophic
+    // backtracking cannot hang the checker. Compiling and testing the empty
+    // string here cannot backtrack.
+    compiled = new RegExp(source, flags);
   } catch (error) {
     return { error: "invalid EXPECT regex: " + error.message };
   }
-  return {
-    kind: "regex",
-    source: match[1],
-    flags: match[2],
-    pathLike: UNESCAPED_SLASH_RE.test(match[1]),
-  };
+  if (compiled.test("")) {
+    return {
+      error: "EXPECT regex " + JSON.stringify(expect) +
+        " matches empty output, so a silent command would pass it; match a success-only marker",
+    };
+  }
+  return { kind: "regex", source, flags, pathLike: UNESCAPED_SLASH_RE.test(source) };
 }
 
-// The checker and Stop hook both consume this exact result. Diagnostics are
-// returned together so callers can report all malformed input in one pass.
+function cwdLeavesRepository(raw) {
+  const value = String(raw);
+  const parts = value.replace(/\\/g, "/").split("/");
+  return isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\") || parts.includes("..");
+}
+
+// The checker, linter, and Stop hook all consume this exact result. Diagnostics
+// are returned together so callers can report all malformed input in one pass.
 export function parseGates(text, options = {}) {
-  const source = String(text);
-  const eol = source.includes("\r\n") ? "\r\n" : "\n";
-  const finalNewline = source.endsWith("\n");
-  const lines = source.split(/\r?\n/);
+  let source = String(text);
+  const bom = source.charCodeAt(0) === 0xfeff;
+  if (bom) source = source.slice(1);
+  const pieces = source.split(/(\r\n|\n)/);
+  const lines = [];
+  const separators = [];
+  let crlf = 0;
+  let lf = 0;
+  for (let index = 0; index < pieces.length; index += 2) {
+    lines.push(pieces[index]);
+    const separator = pieces[index + 1] || "";
+    separators.push(separator);
+    if (separator === "\r\n") crlf++;
+    else if (separator === "\n") lf++;
+  }
+  const eol = crlf > lf ? "\r\n" : "\n";
   const gates = [];
   const abandoned = new Map();
+  const handoffKinds = new Map();
   const owns = [];
   const errors = [];
   const warnings = [];
   const ids = new Map();
   const attrs = new Map();
+  const at = (index) => "line " + (index + 1) + ": ";
   let current = null;
   let seenGate = false;
   let fence = null;
@@ -290,9 +348,18 @@ export function parseGates(text, options = {}) {
       if (close && close[2][0] === fence.character && close[2].length >= fence.length) fence = null;
       continue;
     }
+    const hidden = line.match(HIDDEN_CHARACTER_RE);
+    if (hidden) {
+      errors.push(at(index) + "contains invisible or control character U+" +
+        hidden[0].codePointAt(0).toString(16).toUpperCase().padStart(4, "0") +
+        "; remove it so the parser and a reader see the same text");
+      current = null;
+      continue;
+    }
     const fenceMatch = line.match(FENCE_OPEN_RE);
     if (fenceMatch && !(fenceMatch[2][0] === "`" && fenceMatch[3].includes("`"))) {
       fence = { character: fenceMatch[2][0], length: fenceMatch[2].length };
+      current = null;
       continue;
     }
 
@@ -316,15 +383,21 @@ export function parseGates(text, options = {}) {
       };
       gates.push(current);
       attrs.set(current, new Set());
-      if (!idMatch) errors.push("line " + (index + 1) + ": gate needs an explicit ID followed by a colon");
+      if (!idMatch) errors.push(at(index) + "gate needs an explicit ID followed by a colon");
       else if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
-        errors.push("line " + (index + 1) + ": invalid gate id " + id);
+        errors.push(at(index) + "invalid gate id " + id);
       }
-      if (!title) errors.push("line " + (index + 1) + ": gate outcome is blank");
+      if (!title) errors.push(at(index) + "gate outcome is blank");
       if (ids.has(id)) {
-        errors.push("line " + (index + 1) + ": duplicate gate id " + id +
-          " (first declared on line " + ids.get(id) + ")");
+        errors.push(at(index) + "duplicate gate id " + id + " (first declared on line " + ids.get(id) + ")");
       } else ids.set(id, index + 1);
+      continue;
+    }
+
+    if (CHECKBOX_LIKE_RE.test(line)) {
+      errors.push(at(index) + "checkbox line is not a strict gate; write `- [ ] ID: outcome` " +
+        "at column 1 with single spaces");
+      current = null;
       continue;
     }
 
@@ -332,15 +405,14 @@ export function parseGates(text, options = {}) {
     // point opposite ways. Diagnose the indented abandonment rather than
     // ignoring it, or the author's honest exit fails with no explanation.
     if (INDENTED_ABANDON_RE.test(line)) {
-      errors.push("line " + (index + 1) +
-        ": indented ABANDON is not applied; start ABANDON at column 1");
+      errors.push(at(index) + "indented ABANDON is not applied; start ABANDON at column 1");
       current = null;
       continue;
     }
 
     const unindented = line.match(UNINDENTED_ATTR_RE);
     if (unindented) {
-      errors.push("line " + (index + 1) + ": unindented " + unindented[1] +
+      errors.push(at(index) + "unindented " + unindented[1] +
         " is not attached to a gate; indent attribute lines with spaces");
       current = null;
       continue;
@@ -348,16 +420,15 @@ export function parseGates(text, options = {}) {
 
     const anyAttr = line.match(ATTR_RE);
     if (anyAttr && !current) {
-      errors.push("line " + (index + 1) + ": orphan " + anyAttr[2] + " is not attached to a gate");
+      errors.push(at(index) + "orphan " + anyAttr[2] + " is not attached to a gate; " +
+        "keep attributes directly under their gate line");
       continue;
     }
-    const attrMatch = current && anyAttr;
-    if (attrMatch) {
-      const key = attrMatch[2].toLowerCase();
-      const value = attrMatch[3].trim();
+    if (anyAttr) {
+      const key = anyAttr[2].toLowerCase();
+      const value = anyAttr[3].trim();
       if (attrs.get(current).has(key)) {
-        errors.push("line " + (index + 1) + ": duplicate " + attrMatch[2] +
-          " for gate " + current.id);
+        errors.push(at(index) + "duplicate " + anyAttr[2] + " for gate " + current.id);
       }
       attrs.get(current).add(key);
       if (key === "evidence") {
@@ -371,31 +442,46 @@ export function parseGates(text, options = {}) {
     if (abandonMatch) {
       const id = abandonMatch[1].replace(/:$/, "");
       const reason = abandonMatch[2].trim();
-      if (!id) errors.push("line " + (index + 1) + ": ABANDON needs a gate id and reason");
-      else if (!reason) errors.push("line " + (index + 1) + ": ABANDON " + id + " needs a non-blank reason");
-      else if (abandoned.has(id)) errors.push("line " + (index + 1) + ": duplicate ABANDON for " + id);
-      else abandoned.set(id, reason);
+      const kindMatch = reason.match(HANDOFF_KIND_RE);
+      const detail = kindMatch ? kindMatch[2].trim() : reason;
+      if (!id) errors.push(at(index) + "ABANDON needs a gate id and reason");
+      else if (!detail) errors.push(at(index) + "ABANDON " + id + " needs a non-blank reason");
+      else if (abandoned.has(id)) errors.push(at(index) + "duplicate ABANDON for " + id);
+      else {
+        abandoned.set(id, reason);
+        handoffKinds.set(id, kindMatch ? kindMatch[1] : "ABANDONED");
+      }
       current = null;
       continue;
     }
 
     const ownsMatch = line.match(OWNS_RE);
     if (ownsMatch) {
+      current = null;
       if (seenGate) {
-        errors.push("line " + (index + 1) + ": OWNS must appear before the first gate");
-        current = null;
+        errors.push(at(index) + "OWNS must appear before the first gate");
         continue;
       }
       const declared = ownsMatch[1].split(",").map((item) => item.trim()).filter(Boolean);
-      if (!declared.length) errors.push("line " + (index + 1) + ": OWNS declares no paths");
+      if (!declared.length) errors.push(at(index) + "OWNS declares no paths");
       for (const item of declared) {
         const normalized = normalizeOwnsGlob(item);
-        if (normalized.error) errors.push("line " + (index + 1) + ": " + normalized.error);
+        if (normalized.error) errors.push(at(index) + normalized.error);
         else owns.push(normalized.value);
       }
       continue;
     }
-    if (/^#|^- /.test(line)) current = null;
+
+    if (ATTRIBUTE_LOOKALIKE_RE.test(line)) {
+      errors.push(at(index) + "malformed attribute; write CHECK:, EXPECT:, CWD:, and EVIDENCE: in " +
+        "uppercase indented under their gate, and ABANDON: or OWNS: at column 1");
+      current = null;
+      continue;
+    }
+    // A blank line, heading, or prose ends the gate's attribute block, so an
+    // attribute separated from its gate is an orphan instead of attaching
+    // silently across unrelated text.
+    current = null;
   }
 
   if (fence) errors.push("unclosed fenced block");
@@ -420,8 +506,12 @@ export function parseGates(text, options = {}) {
           " are wildcards. Escape the inner slashes to keep the pattern, or drop" +
           " the wrapping slashes to match a literal substring.");
       }
-      gate.expectation = parsed;
+      gate.expectation = parsed.error ? null : parsed;
     } else gate.expectation = null;
+    if (gate.cwd && cwdLeavesRepository(gate.cwd)) {
+      warnings.push("gate " + gate.id + ": CWD " + JSON.stringify(gate.cwd) +
+        " is absolute or climbs with ..; keep CWD repository-relative so approvals and evidence stay portable");
+    }
   }
 
   for (const id of abandoned.keys()) {
@@ -429,17 +519,57 @@ export function parseGates(text, options = {}) {
   }
   if (options.requireGates !== false && gates.length === 0) errors.push("ledger contains zero live gates");
 
-  return { lines, eol, finalNewline, gates, abandoned, owns, errors, warnings };
+  return { bom, lines, separators, eol, gates, abandoned, handoffKinds, owns, errors, warnings };
 }
 
 export function formatDocument(doc) {
-  let output = doc.lines.join(doc.eol);
-  if (doc.finalNewline && !output.endsWith(doc.eol)) output += doc.eol;
+  let output = doc.bom ? "\ufeff" : "";
+  for (let index = 0; index < doc.lines.length; index++) {
+    output += doc.lines[index] + (doc.separators[index] || "");
+  }
   return output;
+}
+
+// Insert one line while keeping every existing separator byte-for-byte. A
+// ledger without a final newline keeps that shape after the insert.
+export function insertLine(doc, index, text) {
+  if (index >= doc.lines.length) {
+    if (doc.lines.length && !doc.separators[doc.lines.length - 1]) doc.separators[doc.lines.length - 1] = doc.eol;
+    doc.lines.push(text);
+    doc.separators.push("");
+    return;
+  }
+  doc.lines.splice(index, 0, text);
+  doc.separators.splice(index, 0, doc.eol);
 }
 
 export function qualify(fileOrLabel, id) {
   return basename(String(fileOrLabel)).replace(/\.md$/i, "") + ":" + id;
+}
+
+// Qualify ids by file stem, widening to a relative path only for stems that
+// collide, so leaf-a/GATES.md and leaf-b/GATES.md never share a label.
+export function ledgerLabels(files) {
+  const stems = files.map((file) => basename(String(file)).replace(/\.md$/i, ""));
+  const counts = new Map();
+  for (const stem of stems) counts.set(stem, (counts.get(stem) || 0) + 1);
+  const absolute = files.map((file) => resolve(String(file)));
+  let common = absolute.length ? dirname(absolute[0]).split(sep) : [];
+  for (const file of absolute.slice(1)) {
+    const parts = dirname(file).split(sep);
+    let shared = 0;
+    while (shared < common.length && shared < parts.length && common[shared] === parts[shared]) shared++;
+    common = common.slice(0, shared);
+  }
+  const base = common.join(sep) || sep;
+  const labels = new Map();
+  files.forEach((file, index) => {
+    const label = counts.get(stems[index]) === 1
+      ? stems[index]
+      : relative(base, absolute[index]).split(sep).join("/").replace(/\.md$/i, "");
+    labels.set(file, label);
+  });
+  return labels;
 }
 
 export function gateDefinitionDigest(gate) {
@@ -493,10 +623,20 @@ export function gateState(gate, abandoned) {
   return "met";
 }
 
-export function tail(output, max = 240) {
-  const lines = String(output).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  return (lines.slice(-2).join(" | ") || "(no output)").slice(0, max);
+// Extract `inputs=<path>@<12 hex>,...` from an automatic evidence transcript.
+// The field is opaque transcript detail: it never decides currentness.
+export function evidenceInputs(evidence) {
+  const match = String(evidence || "").match(/(?:^|; )inputs=([^;]*)/);
+  if (!match || !match[1]) return new Map();
+  const inputs = new Map();
+  for (const item of match[1].split(",")) {
+    const at = item.lastIndexOf("@");
+    if (at > 0 && /^[a-f0-9]{12}$/.test(item.slice(at + 1))) inputs.set(item.slice(0, at), item.slice(at + 1));
+  }
+  return inputs;
 }
+
+// ------------------------------------------------------------ scopes
 
 export function validateScopeId(value, label = "scope") {
   const id = String(value || "");
@@ -521,19 +661,15 @@ export function normalizeOwnsGlob(value) {
   return { value: normalized };
 }
 
-export function literalPrefix(glob) {
-  const normalized = normalizeOwnsGlob(glob);
-  if (normalized.error) return "";
-  const literal = [];
-  for (const part of normalized.value.split("/")) {
-    if (/[*?[{]/.test(part)) break;
-    literal.push(part);
-  }
-  return literal.join("/");
+function comparableSegment(value) {
+  const normalized = value.normalize("NFC");
+  return CASE_INSENSITIVE_PATHS ? normalized.toLowerCase() : normalized;
 }
 
 // Prove disjointness only when literal path segments disagree. Everything else
-// conflicts, including mid-segment pairs such as a* and ab*.
+// conflicts, including mid-segment pairs such as a* and ab*. Segments compare
+// after Unicode NFC normalization and, on the default case-insensitive
+// filesystems of Windows and macOS, case folding.
 export function globsOverlap(left, right) {
   const a = normalizeOwnsGlob(left);
   const b = normalizeOwnsGlob(right);
@@ -544,11 +680,10 @@ export function globsOverlap(left, right) {
   for (let index = 0; index < count; index++) {
     const av = as[index], bv = bs[index];
     if (/[*?[{]/.test(av) || /[*?[{]/.test(bv)) return true;
-    if (av !== bv) return false;
+    if (comparableSegment(av) !== comparableSegment(bv)) return false;
   }
-  // An exact prefix may denote a directory ownership claim, so it can overlap
-  // every descendant. Treat common-prefix length differences as conflicts.
-  if (as.length !== bs.length) return true;
+  // One path is a prefix of the other: an exact prefix may denote a directory
+  // claim over every descendant, and equal paths trivially overlap.
   return true;
 }
 
@@ -611,18 +746,35 @@ function legacyDiscovery(root) {
   return { files, errors: nested.errors };
 }
 
-export function scopeFiles(root, scope) { return scopeDiscovery(root, scope).files; }
-export function legacyFiles(root) { return legacyDiscovery(root).files; }
+export function scopeHasLedger(root, scope) {
+  return scopeDiscovery(root, scope).files.length > 0;
+}
 
 function targetFromDiscovery(mode, scope, discovery) {
   return { mode, scope, files: discovery.files, discoveryErrors: discovery.errors };
+}
+
+function canonicalOrResolved(file) {
+  try { return realpathSync(file); }
+  catch { return resolve(file); }
 }
 
 export function resolveTarget(options = {}) {
   const root = resolve(options.root || process.cwd());
   const files = options.files || [];
   const sessionId = options.sessionId || null;
-  if (files.length) return { mode: "explicit", scope: null, files: files.map((file) => resolve(root, file)) };
+  if (files.length) {
+    // The same ledger named twice, or through an alias, runs and counts once.
+    const seen = new Set();
+    const unique = [];
+    for (const file of files.map((item) => resolve(root, item))) {
+      const identity = canonicalOrResolved(file);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      unique.push(file);
+    }
+    return { mode: "explicit", scope: null, files: unique, duplicates: files.length - unique.length };
+  }
 
   const scopes = listScopes(root);
   const wanted = options.scope || process.env.UNLAZY_SCOPE || null;
@@ -641,7 +793,7 @@ export function resolveTarget(options = {}) {
         return targetFromDiscovery("scope", wanted, scopeDiscovery(root, wanted));
       }
       return {
-        mode: "none", scope: wanted, files: [],
+        mode: "none", scope: wanted, files: [], missingScope: true,
         error: "no such scope \"" + wanted + "\" under " + UNLAZY_DIR + "/ (have: " +
           (scopes.join(", ") || "none") + ")",
       };
@@ -649,18 +801,14 @@ export function resolveTarget(options = {}) {
     return targetFromDiscovery("scope", wanted, scopeDiscovery(root, wanted));
   }
 
+  if (scopes.length && sessionId) {
+    const owned = scopes.filter((scope) => readSessionBinding(root, scope) === String(sessionId).trim());
+    if (owned.length === 1) {
+      return { ...targetFromDiscovery("scope", owned[0], scopeDiscovery(root, owned[0])), bound: true };
+    }
+  }
   if (scopes.length === 1) return targetFromDiscovery("scope", scopes[0], scopeDiscovery(root, scopes[0]));
   if (scopes.length > 1) {
-    if (sessionId) {
-      const owned = scopes.filter((scope) => {
-        try {
-          return readStableRegularFile(join(scopeRoot(root, scope), "session"), {
-            root, maxBytes: 4096, label: "session binding",
-          }).trim() === String(sessionId).trim();
-        } catch { return false; }
-      });
-      if (owned.length === 1) return targetFromDiscovery("scope", owned[0], scopeDiscovery(root, owned[0]));
-    }
     return {
       mode: "none", scope: null, files: [], ambiguous: scopes,
       error: scopes.length + " pipelines present (" + scopes.join(", ") +
@@ -673,13 +821,68 @@ export function resolveTarget(options = {}) {
   return { mode: "none", scope: null, files: [] };
 }
 
+export function readSessionBinding(root, scope) {
+  try {
+    return readStableRegularFile(join(scopeRoot(root, scope), "session"), {
+      root, maxBytes: 4096, label: "session binding",
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
 export function statusLogPath(root, scope) {
   return scope ? join(scopeRoot(root, scope), "status.log") : join(root, "unlazy-status.log");
 }
 
-export function hookStatePath(root, scope) {
-  return scope ? join(scopeRoot(root, scope), "hook-state.json") : join(root, ".unlazy-hook-state.json");
+// ------------------------------------------------------ per-user state
+
+// Per-user state (approvals, Stop-hook progress, their locks) lives outside
+// every repository so a ledger edit, `git clean`, or a checkout cannot reset it.
+export function unlazyStateHome() {
+  const configured = process.env.UNLAZY_STATE_DIR;
+  return resolve(configured && configured.trim() ? configured : join(homedir(), ".unlazy"));
 }
+
+// One progress file per host session. A session can move between roots, so
+// its guard counter must not depend on the directory it stopped in.
+export function hookStatePath(sessionId) {
+  return join(unlazyStateHome(), "hook-state", sha256("session\0" + String(sessionId)).slice(0, 32) + ".json");
+}
+
+export function assertPrivateEntry(path, info, kind) {
+  if (info.isSymbolicLink() || (kind === "directory" ? !info.isDirectory() : !info.isFile())) {
+    throw new Error(path + " must be a real " + kind);
+  }
+  const uid = typeof process.geteuid === "function" ? process.geteuid()
+    : typeof process.getuid === "function" ? process.getuid() : null;
+  const expectedUid = typeof info.uid === "bigint" && uid !== null ? BigInt(uid) : uid;
+  if (uid !== null && info.uid !== expectedUid) {
+    throw new Error(path + " must be owned by the current user");
+  }
+  const permissionMask = typeof info.mode === "bigint" ? 0o077n : 0o077;
+  const extraPermissions = info.mode & permissionMask;
+  if (process.platform !== "win32" && extraPermissions !== 0 && extraPermissions !== 0n) {
+    throw new Error(path + " must not grant group or other permissions; fix with: chmod " +
+      (kind === "directory" ? "700 " : "600 ") + JSON.stringify(path));
+  }
+}
+
+// Create or validate an owner-private real directory and return its canonical
+// identity. Every creation step uses mode 0700.
+export function privateDirectory(path, { create = false } = {}) {
+  const target = resolve(path);
+  if (create) mkdirSync(target, { recursive: true, mode: 0o700 });
+  else if (!existsSync(target)) return null;
+  const info = lstatSync(target, { bigint: true });
+  assertPrivateEntry(target, info, "directory");
+  const canonical = realpathSync(target);
+  const canonicalInfo = lstatSync(canonical, { bigint: true });
+  assertPrivateEntry(canonical, canonicalInfo, "directory");
+  return { path: canonical, dev: canonicalInfo.dev, ino: canonicalInfo.ino };
+}
+
+// ------------------------------------------------------- durable writes
 
 function assertSafeStatePath(root, target) {
   const stateRoot = join(resolve(root), UNLAZY_DIR);
@@ -693,6 +896,23 @@ function assertSafeStatePath(root, target) {
   if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(parent + " must be a real directory");
 }
 
+function fsyncDirectory(directory) {
+  if (process.platform === "win32") return;
+  let fd = null;
+  try {
+    fd = openSync(directory, fsConstants.O_RDONLY);
+    fsyncSync(fd);
+  } catch (error) {
+    // Some filesystems cannot fsync a directory. The rename already happened;
+    // only an unexpected failure is worth surfacing.
+    if (!error || !DIRECTORY_FSYNC_UNSUPPORTED.has(error.code)) throw error;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+// Replace a file atomically, keeping an existing file's permission bits.
+// `options.randomSuffix` exists so tests can force a temp-name collision.
 export function writeAtomic(file, text, options = {}) {
   const target = resolve(file);
   if (options.root) assertSafeStatePath(options.root, target);
@@ -702,31 +922,44 @@ export function writeAtomic(file, text, options = {}) {
     const info = lstatSync(parent);
     if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(parent + " must be a real directory");
   }
+  let existingMode = null;
   try {
     const existing = lstatSync(target);
     if (existing.isSymbolicLink()) throw new Error("refusing to replace symlink " + target);
+    existingMode = existing.mode & 0o7777;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
+  const suffix = typeof options.randomSuffix === "function"
+    ? options.randomSuffix
+    : () => randomBytes(8).toString("hex");
   let temp = "";
   let fd = null;
   for (let attempt = 0; attempt < 8; attempt++) {
-    temp = target + "." + process.pid + "." + randomBytes(8).toString("hex") + ".tmp";
+    temp = target + "." + process.pid + "." + suffix(attempt) + ".tmp";
     try { fd = openSync(temp, "wx", 0o600); break; }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
+    catch (error) {
+      temp = "";
+      if (error.code !== "EEXIST") throw error;
+    }
   }
   if (fd === null) throw new Error("could not create a unique temporary file for " + target);
   try {
+    if (existingMode !== null && process.platform !== "win32") fchmodSync(fd, existingMode);
     writeFileSync(fd, String(text), "utf8");
     fsyncSync(fd);
     closeSync(fd);
     fd = null;
     replaceAtomic(temp, target);
+    temp = "";
+    fsyncDirectory(dirname(target));
   } finally {
-    if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
-    if (temp) try { unlinkSync(temp); } catch { /* renamed or absent */ }
+    if (fd !== null) try { closeSync(fd); } catch { /* the write already failed */ }
+    if (temp) try { unlinkSync(temp); } catch { /* never created or already renamed */ }
   }
 }
+
+// ---------------------------------------------------------------- locks
 
 function lockDirectory(root) {
   // Use the physical root so lexical aliases of one repository share one lock
@@ -763,11 +996,60 @@ function canonicalLockTarget(target) {
   }
 }
 
+function lockFileFor(directory, target) {
+  return join(directory, sha256(canonicalLockTarget(target)).slice(0, 24) + ".filelock");
+}
+
+// The lock namespace for a ledger depends only on the ledger's canonical path,
+// never on where the checker was launched: the parent of an enclosing
+// `.unlazy` directory, the parent of a legacy `gates/` directory, or the
+// ledger's own directory.
+export function ledgerLockRoot(file) {
+  const canonical = canonicalLockTarget(file);
+  const parts = canonical.split(sep);
+  const marker = parts.lastIndexOf(UNLAZY_DIR);
+  if (marker > 0) {
+    const prefix = parts.slice(0, marker).join(sep);
+    return prefix === "" ? sep : prefix.endsWith(":") ? prefix + sep : prefix;
+  }
+  const directory = dirname(canonical);
+  return basename(directory) === "gates" ? dirname(directory) : directory;
+}
+
+export function describeLock(root, target, options = {}) {
+  let directory;
+  try {
+    directory = options.lockDir ? realpathSync(resolve(options.lockDir)) : join(realpathSync(resolve(root)), LOCK_DIR);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return { path: null, exists: false };
+    throw error;
+  }
+  const path = lockFileFor(directory, target);
+  let text;
+  try {
+    text = readStableRegularFile(path, { maxBytes: LOCK_RECORD_MAX_BYTES, label: "lock record" });
+  } catch (error) {
+    if (error && error.code === "ENOENT") return { path, exists: false };
+    return { path, exists: true, pid: null, alive: null, problem: error.message };
+  }
+  let value = null;
+  try { value = JSON.parse(text); } catch { value = null; }
+  const pid = value && Number.isInteger(value.pid) && value.pid > 0 ? value.pid : null;
+  return { path, exists: true, pid, alive: pid === null ? null : processAlive(pid) };
+}
+
+export function lockOwnerText(info) {
+  if (!info || !info.exists) return "no lock present";
+  if (info.pid === null) return "owner unknown" + (info.problem ? " (" + info.problem + ")" : "");
+  return "owner pid " + info.pid + (info.alive ? " is running" : " is not running");
+}
+
 export async function withFileLock(root, target, fn, options = {}) {
   const timeoutMs = options.timeoutMs === undefined ? 30000 : options.timeoutMs;
-  const directory = lockDirectory(root);
-  const lockTarget = canonicalLockTarget(target);
-  const lock = join(directory, sha256(lockTarget).slice(0, 24) + ".filelock");
+  const directory = options.lockDir
+    ? privateDirectory(options.lockDir, { create: true }).path
+    : lockDirectory(root);
+  const lock = lockFileFor(directory, target);
   const deadline = Date.now() + timeoutMs;
   const token = randomBytes(16).toString("hex");
   let fd = null;
@@ -789,35 +1071,41 @@ export async function withFileLock(root, target, fn, options = {}) {
         else if (!isTransientWindowsFsError(statError)) throw statError;
       }
       if (Date.now() >= deadline) {
-        throw new Error("timed out waiting for lock on " + target + " (last filesystem error: " + error.code + ")");
+        const owner = describeLock(root, target, options);
+        throw new Error("timed out after " + Math.round(timeoutMs / 1000) + "s waiting for lock " + lock +
+          " on " + target + " (" + lockOwnerText(owner) + "); remove that one lock file only after " +
+          "confirming its owner is not running");
       }
       if (missing && error.code === "EEXIST") continue;
       await sleep(15 + Math.floor(Math.random() * 25));
     }
   }
-  let identified = false;
   try {
-    writeFileSync(fd, JSON.stringify({ token, pid: process.pid, target: lockTarget, at: Date.now() }));
-    identified = true;
-  } catch { /* leave for manual cleanup rather than risk deleting a successor */ }
+    writeFileSync(fd, JSON.stringify({ token, pid: process.pid, target: canonicalLockTarget(target), at: Date.now() }));
+  } catch (error) {
+    // This process created the name with O_EXCL a moment ago, so removing it
+    // cannot delete a successor's lock. A nameless lock would otherwise need
+    // manual cleanup with no owner to verify.
+    try { closeSync(fd); } catch { /* reported below with the write failure */ }
+    try { unlinkSync(lock); } catch { /* reported below with the write failure */ }
+    throw new Error("could not record lock owner in " + lock + ": " + error.message);
+  }
   try { return await fn(); }
   finally {
-    try { closeSync(fd); } catch { /* ignore */ }
-    if (identified) {
-      const deadline = Date.now() + 2000;
-      let delay = 5;
-      for (;;) {
-        try {
-          const current = JSON.parse(readFileSync(lock, "utf8"));
-          if (current.token === token) unlinkSync(lock);
-          break;
-        } catch (error) {
-          if (error && error.code === "ENOENT") break;
-          const remaining = deadline - Date.now();
-          if (!isTransientWindowsFsError(error) || remaining <= 0) break;
-          await sleep(Math.min(delay, remaining));
-          delay = Math.min(delay * 2, 100);
-        }
+    try { closeSync(fd); } catch { /* the lock name is released below */ }
+    const releaseDeadline = Date.now() + 2000;
+    let delay = 5;
+    for (;;) {
+      try {
+        const current = JSON.parse(readFileSync(lock, "utf8"));
+        if (current.token === token) unlinkSync(lock);
+        break;
+      } catch (error) {
+        if (error && error.code === "ENOENT") break;
+        const remaining = releaseDeadline - Date.now();
+        if (!isTransientWindowsFsError(error) || remaining <= 0) break;
+        await sleep(Math.min(delay, remaining));
+        delay = Math.min(delay * 2, 100);
       }
     }
   }
@@ -857,19 +1145,21 @@ export function appendStatus(root, scope, line) {
     fsyncSync(fd);
     return path;
   } finally {
-    if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
+    if (fd !== null) try { closeSync(fd); } catch { /* the append already succeeded or threw */ }
   }
 }
+
+// --------------------------------------------------------------- leases
 
 function readLeasesUnlocked(root) {
   const directory = join(resolve(root), LOCK_DIR);
   try { lstatSync(directory); }
   catch (error) {
     if (error && error.code === "ENOENT") return [];
-    return [{ scope: "(invalid)", leaf: "locks", globs: ["**"], file: directory, invalid: true }];
+    return [{ scope: "(invalid)", leaf: "locks", globs: ["**"], file: directory, invalid: true, container: true }];
   }
   if (!realDirectoryInside(root, directory)) {
-    return [{ scope: "(invalid)", leaf: "locks", globs: ["**"], file: directory, invalid: true }];
+    return [{ scope: "(invalid)", leaf: "locks", globs: ["**"], file: directory, invalid: true, container: true }];
   }
   const leases = [];
   for (const name of readdirSync(directory).sort()) {
@@ -930,7 +1220,7 @@ export async function claimLeases(root, spec) {
     for (const glob of normalized) {
       for (const held of heldLeases) {
         const theirGlob = held.globs.find((other) => globsOverlap(glob, other));
-        if (theirGlob) conflicts.push({ glob, with: held.scope + "/" + held.leaf, theirGlob });
+        if (theirGlob) conflicts.push({ glob, with: held.scope + "/" + held.leaf, theirGlob, invalid: Boolean(held.invalid) });
       }
     }
     if (conflicts.length) return { ok: false, conflicts };
@@ -946,8 +1236,31 @@ export async function releaseLeases(root, spec) {
     for (const lease of readLeasesUnlocked(root)) {
       if (lease.scope !== spec.scope) continue;
       if (spec.leaf && lease.leaf !== spec.leaf) continue;
-      try { unlinkSync(lease.file); count++; } catch { /* raced or absent */ }
+      try {
+        unlinkSync(lease.file);
+        count++;
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
     }
     return count;
+  });
+}
+
+// Remove lease records that fail validation (linked, special, oversized,
+// malformed, or misnamed). A valid lease is never touched here.
+export async function releaseInvalidLeases(root) {
+  return withFileLock(root, leaseRegistry(root), () => {
+    const removed = [];
+    for (const lease of readLeasesUnlocked(root)) {
+      if (!lease.invalid || lease.container) continue;
+      try {
+        unlinkSync(lease.file);
+        removed.push(basename(lease.file));
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
+    return removed;
   });
 }

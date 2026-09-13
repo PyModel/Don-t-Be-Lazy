@@ -15,6 +15,7 @@ import {
 import {
   automaticEvidencePrefix, gateDefinitionDigest, gateState, parseGates, sameFileIdentity,
 } from "../scripts/lib/gates.mjs";
+import { requireFifo, reviewAndRun, runNode, runSuite, skip, tokensFrom } from "./lib/harness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GATE_CHECK = join(HERE, "..", "scripts", "gate-check.mjs");
@@ -29,8 +30,9 @@ function sandbox() {
   // the fixture boundary so every path assertion is portable.
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "unlazy-hardening-")));
   const approvals = realpathSync(mkdtempSync(join(tmpdir(), "unlazy-approval-")));
+  const state = realpathSync(mkdtempSync(join(tmpdir(), "unlazy-state-")));
   return {
-    dir, approvals,
+    dir, approvals, state,
     path(rel) { return join(dir, rel); },
     write(rel, text) {
       const path = join(dir, rel);
@@ -42,32 +44,28 @@ function sandbox() {
     cleanup() {
       rmSync(dir, { recursive: true, force: true });
       rmSync(approvals, { recursive: true, force: true });
+      rmSync(state, { recursive: true, force: true });
     },
   };
 }
 
 function run(script, args, options = {}) {
-  return new Promise((done) => {
-    const child = execFile(process.execPath, [script, ...args], {
-      cwd: options.cwd,
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, ...(options.env || {}) },
-      timeout: options.timeoutMs,
-    }, (error, stdout, stderr) => {
-      done({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, out: (stdout || "") + (stderr || "") });
-    });
-    if (options.stdin !== undefined) child.stdin.end(options.stdin);
-  });
+  return runNode(script, args, options);
 }
 
 function gateRun(s, args, options = {}) {
-  const action = args.some((arg) => ["--status", "--claim", "--release", "--list-scopes", "--log", "--bind", "--help"].includes(arg));
-  const actual = options.approve !== false && !action && !args.includes("--approve") ? ["--approve", ...args] : args;
-  return run(GATE_CHECK, actual, {
+  const runOptions = {
     cwd: s.dir,
-    env: { UNLAZY_APPROVAL_DIR: s.approvals, ...(options.env || {}) },
+    env: { UNLAZY_APPROVAL_DIR: s.approvals, UNLAZY_STATE_DIR: s.state, ...(options.env || {}) },
     timeoutMs: options.timeoutMs,
+  };
+  return options.approve === false ? runNode(GATE_CHECK, args, runOptions) : reviewAndRun(GATE_CHECK, args, runOptions);
+}
+
+function hookRun(s, args, stdin, options = {}) {
+  return runNode(STOP_HOOK, args, {
+    cwd: s.dir, stdin, timeoutMs: options.timeoutMs,
+    env: { UNLAZY_STATE_DIR: s.state, ...(options.env || {}) },
   });
 }
 
@@ -123,13 +121,14 @@ test("approval: directory identity snapshots retain BigInt precision", () => {
   // Portable filesystems cannot promise adjacent >2^53 inode fixtures. Lock
   // the three real approval-store acquisition sites to BigInt while the pure
   // alias control above proves why Number snapshots are insufficient.
-  const checkerSource = readFileSync(GATE_CHECK, "utf8");
+  const storeSource = readFileSync(join(HERE, "..", "scripts", "lib", "approval.mjs"), "utf8") +
+    readFileSync(join(HERE, "..", "scripts", "lib", "gates.mjs"), "utf8");
   for (const acquisition of [
-    "lstatSync(approvalDir, { bigint: true })",
+    "lstatSync(target, { bigint: true })",
     "lstatSync(canonical, { bigint: true })",
     "lstatSync(store.path, { bigint: true })",
-  ]) has(checkerSource, acquisition, "approval-directory implementation");
-  has(checkerSource, "sameFileIdentity(current, store)", "approval-directory implementation");
+  ]) has(storeSource, acquisition, "approval-directory implementation");
+  has(storeSource, "sameFileIdentity(current, store)", "approval-directory implementation");
 });
 
 test("definition digest: golden vector and stale evidence state table are exact", () => {
@@ -228,7 +227,7 @@ test("approval: status is read-only and an unapproved CHECK is printed but not r
     assert(s.read("GATES.md") === before, "status changed ledger");
     assert(!readdirSync(s.approvals).length, "status wrote approval state");
     const denied = await gateRun(s, [], { approve: false });
-    assert(denied.code === 1, "unapproved run should remain unmet");
+    assert(denied.code === 4, "unapproved run should exit 4 (approval required), got " + denied.code + "\n" + denied.out);
     has(denied.out, "APPROVAL REQUIRED GATES:G1");
     has(denied.out, "NOT RUN");
     assert(!s.path("ran.txt") || !await fileExists(s.path("ran.txt")), "unapproved CHECK executed");
@@ -236,8 +235,9 @@ test("approval: status is read-only and an unapproved CHECK is printed but not r
     assert(approved.code === 0, approved.out);
     const currentLedger = s.read("GATES.md");
     const unverified = await gateRun(s, ["--reverify", "--timeout", "121"], { approve: false });
-    assert(unverified.code === 1, "unapproved reverify must not certify existing evidence\n" + unverified.out);
-    has(unverified.out, "GATES:G1 (reverify not run)");
+    assert(unverified.code === 4, "unapproved reverify must not certify existing evidence\n" + unverified.out);
+    has(unverified.out, "GATES:G1 (reverify not run: approval required)");
+    lacks(unverified.out, "ALL MET", "unapproved reverify");
     assert(s.read("GATES.md") === currentLedger, "unapproved reverify changed current evidence");
   } finally { s.cleanup(); }
 });
@@ -257,12 +257,15 @@ test("approval: token binds the full oracle and changing CWD invalidates it", as
     const tokens = readdirSync(s.approvals).filter((name) => name.endsWith(".json"));
     assert(tokens.length === 1, "expected one approval token");
     const token = JSON.parse(readFileSync(join(s.approvals, tokens[0]), "utf8"));
-    for (const key of ["check", "expect", "cwd", "shell", "timeoutMs", "maxOutputBytes", "regexTimeoutMs", "platform", "path"]) {
+    for (const key of [
+      "check", "expect", "cwd", "cwdIdentity", "ledgerDirectoryIdentity", "shell", "timeoutMs", "maxOutputBytes",
+      "regexTimeoutMs", "regexStartupTimeoutMs", "maxRegexWorkers", "platform", "path", "inputs",
+    ]) {
       assert(Object.prototype.hasOwnProperty.call(token.oracle, key), "approval oracle missing " + key);
     }
     s.write("GATES.md", gate("G1", "oracle", "node check.mjs", "OK", "  CWD: b\n"));
     const changed = await gateRun(s, [], { approve: false });
-    assert(changed.code === 1, changed.out);
+    assert(changed.code === 4, changed.out);
     has(changed.out, "APPROVAL REQUIRED");
     has(changed.out, join(s.dir, "b"));
   } finally { s.cleanup(); }
@@ -275,10 +278,9 @@ test("approval: storage failures use the infrastructure exit code", async () => 
     s.write("GATES.md", gate("G1", "approval storage", "node ok.mjs", "OK"));
     rmSync(s.approvals, { recursive: true, force: true });
     writeFileSync(s.approvals, "not a directory\n");
-    const result = await gateRun(s, ["--approve"], {
-      approve: false,
-      env: { UNLAZY_APPROVAL_DIR: join(s.approvals, "records") },
-    });
+    // Review succeeds against an absent store; recording the approval then
+    // fails because the store path runs through a regular file.
+    const result = await gateRun(s, [], { env: { UNLAZY_APPROVAL_DIR: join(s.approvals, "records") } });
     assert(result.code === 2, "approval storage failure returned " + result.code + "\n" + result.out);
     has(result.out, "infrastructure failure prevented 1 approval");
   } finally { s.cleanup(); }
@@ -306,7 +308,7 @@ test("approval: a lexical outside alias cannot resolve back into the repository"
 });
 
 test("approval: an existing store must remain private to its owner", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     s.write("ok.mjs", "console.log('OK');\n");
@@ -319,7 +321,7 @@ test("approval: an existing store must remain private to its owner", async () =>
 });
 
 test("approval: a FIFO record is rejected without blocking or executing", async () => {
-  if (process.platform === "win32") return;
+  requireFifo();
   const s = sandbox();
   try {
     s.write("marker.mjs", "import { writeFileSync } from 'node:fs'; writeFileSync('ran.txt','yes'); console.log('OK');\n");
@@ -381,14 +383,14 @@ test("shell: resolution and PATH context are visible, invalid overrides are usag
     const good = await gateRun(s, []);
     assert(good.code === 0, good.out);
     has(good.out, "shell=");
-    has(good.out, "PATH=");
+    has(good.out, "path=sha256:");
     const ledger = s.read("GATES.md");
     has(ledger, "; shell=");
     has(ledger, "; path=");
     s.write("GATES.md", gate("G1", "shell", "node ok.mjs", "SHELL-OK"));
     const bad = await gateRun(s, ["--shell", "definitely-missing-shell"], { approve: false });
     assert(bad.code === 2, bad.out);
-    has(bad.out, "cannot resolve command shell");
+    has(bad.out, "cannot resolve an executable command shell");
   } finally { s.cleanup(); }
 });
 
@@ -492,7 +494,7 @@ test("evidence binding: status is environment-independent and stale reruns repai
     has(staleStatus.out, "checked but automatic evidence is stale or unbound");
     assert(s.read("GATES.md") === staleBytes, "stale status rewrote evidence");
     const denied = await gateRun(s, [], { approve: false });
-    assert(denied.code === 1, denied.out);
+    assert(denied.code === 4, denied.out);
     has(denied.out, "APPROVAL REQUIRED GATES:G1");
     assert(s.read("runs.log") === runsBeforeStatus, "unapproved edited CHECK executed");
     const failed = await gateRun(s, []);
@@ -556,7 +558,9 @@ test("evidence binding: status is environment-independent and stale reruns repai
     // survive the failed rerun.
     s.write("run-b.mjs", "console.log('WRONG');\n");
     s.write("GATES.md", ledger.replace(/EVIDENCE: .*$/m, "EVIDENCE: legacy writer transcript"));
-    const legacyFailure = await gateRun(s, [], { approve: false });
+    // Editing a script named in CHECK changes the approved oracle, so the
+    // failing rerun is reviewed and approved like any changed verifier.
+    const legacyFailure = await gateRun(s, []);
     assert(legacyFailure.code === 1, legacyFailure.out);
     const demoted = s.read("GATES.md");
     has(demoted, "- [ ] G1: bound evidence");
@@ -567,7 +571,7 @@ test("evidence binding: status is environment-independent and stale reruns repai
 });
 
 test("evidence binding: long runtime transcript cannot truncate definition or output digests", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     const deep = Array.from({ length: 22 }, (_, index) =>
@@ -597,7 +601,10 @@ test("terminal: repository titles and diagnostics cannot emit controls, line sep
   try {
     s.write("GATES.md", "- [ ] G1: title\u001b]0;owned\u0007\u202eevil\n  EVIDENCE: pending\n");
     const status = await gateRun(s, ["--status"], { approve: false });
-    assert(status.code === 1, status.out);
+    // Controls inside ledger text are parse errors; the diagnostic names the
+    // code point instead of echoing the character.
+    assert(status.code === 2, status.out);
+    has(status.out, "U+001B");
     assert(!/[\u001b\u0007\u2028\u2029\u202e]/.test(status.out), "terminal controls survived status output");
 
     const cli = await gateRun(s, ["--bad-\u2028\u2029"], { approve: false });
@@ -610,7 +617,7 @@ test("terminal: repository titles and diagnostics cannot emit controls, line sep
     const failed = await gateRun(s, []);
     assert(failed.code === 1, failed.out);
     assert(!failed.out.includes("\u001b"), "terminal escape survived failure output");
-    has(failed.out, "failure [31m red [0m");
+    has(failed.out, "failure" + String.fromCharCode(92) + "x1b[31m red" + String.fromCharCode(92) + "x1b[0m");
   } finally { s.cleanup(); }
 });
 
@@ -1013,9 +1020,14 @@ test("targeting: explicit files anchor relative commands and every positional fi
     }
     const result = await gateRun(s, ["--timeout", "5", "a/leaf.md", "b/leaf.md"]);
     assert(result.code === 0, result.out);
-    has(result.out, "PASS leaf:G1");
-    has(s.read("a/leaf.md"), "cwd=" + realpathSync(join(s.dir, "a")));
-    has(s.read("b/leaf.md"), "cwd=" + realpathSync(join(s.dir, "b")));
+    // Colliding stems widen to a relative label instead of sharing "leaf:G1".
+    has(result.out, "PASS a/leaf:G1");
+    has(result.out, "PASS b/leaf:G1");
+    // Each explicit ledger anchors beside itself, and evidence records CWD
+    // relative to that ledger's tree instead of an absolute local path.
+    has(s.read("a/leaf.md"), "; cwd=.;");
+    has(s.read("b/leaf.md"), "; cwd=.;");
+    lacks(s.read("a/leaf.md"), s.dir, "portable evidence");
   } finally { s.cleanup(); }
 });
 
@@ -1305,7 +1317,7 @@ test("posix cleanup: an exited supervisor never targets a reusable process group
 });
 
 test("win32 integration: a timed-out shell and nested descendant are both reaped", async () => {
-  if (process.platform !== "win32") return;
+  if (process.platform !== "win32") skip("Windows only");
   const s = sandbox();
   const pids = [];
   try {
@@ -1369,7 +1381,7 @@ test("execution: timeout settlement is bounded even when a detached descendant k
 });
 
 test("posix integration: an exited shell leader still has its ordinary descendants reaped", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   let descendantPid = null;
   try {
@@ -1404,20 +1416,4 @@ test("posix integration: an exited shell leader still has its ordinary descendan
   }
 });
 
-let passed = 0;
-const failures = [];
-for (const item of tests) {
-  try {
-    await item.fn();
-    passed++;
-    console.log("ok   " + item.name);
-  } catch (error) {
-    failures.push(item.name);
-    console.log("FAIL " + item.name + "\n     " + String(error.message).replace(/\n/g, "\n     "));
-  }
-}
-console.log("\n" + passed + "/" + tests.length + " passed");
-if (failures.length) {
-  console.log("failed: " + failures.join(", "));
-  process.exit(1);
-}
+process.exit(await runSuite(tests, { filter: process.argv[2] || "" }));

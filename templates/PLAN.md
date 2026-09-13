@@ -27,6 +27,12 @@ Contract revision: 1. Before fan-out, reread the original request and current am
 
 Use stable ids. On an amendment, increment the revision and reconcile every affected row before dispatch or completion credit. `ACTIVE` is complete only with a current owner and observation. `ABANDONED`, `DEFERRED`, and `OWNER_DECISION` are honest non-completion; only explicit user authority may use `REMOVED_BY_USER`.
 
+Write each observation as a qualified gate such as `leaf-1.1.1:G2`, or as `manual: <reviewer and evidence>`. A `REMOVED_BY_USER` row cites the user's words as `user: "<quote>"`. Check the inventory, dispatch table, and tree without executing anything, passing the ids from rereading the request; without `--require`, an omitted row cannot be detected:
+
+```text
+node <skill-dir>/scripts/plan-check.mjs --require C1,C2 .unlazy/<scope>/PLAN.md
+```
+
 ## State vocabulary
 
 Leaf state is exactly one of:

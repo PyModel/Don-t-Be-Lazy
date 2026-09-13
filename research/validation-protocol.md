@@ -76,6 +76,19 @@ Provide a machine-readable row per run and a script that regenerates every table
 
 Describe results for the tested models, snapshots, tasks, and environments. Do not generalize a small coding comparison to all agents or all substantial work. Record failures and null results as carefully as improvements.
 
+## Effectiveness evaluation
+
+The test suite shows that the tools behave as documented. Whether the skill changes agent behavior is a separate, open question. An evaluation that follows the protocol above would use:
+
+- **Tasks** with hidden acceptance tests the agent never sees: several long, multi-part builds where quiet incompleteness is likely, and a few small tasks that measure overhead on work the skill should not slow down.
+- **Arms** for a baseline with no skill, a plain checklist prompt of similar length, the skill's prose without its scripts, the full skill with the Stop hook where the host supports it, and the host's native task or todo tooling.
+- **A primary metric** of false completion: final reports that claim an outcome the hidden tests show is unmet. Secondary metrics are hidden tests passed, remaining items left unreported, tokens, wall-clock time, and tool calls.
+- **Repetitions** of 5 to 10 independent runs per task, arm, and model, in randomized order, with the analysis plan registered before the first run.
+- **Grading** of hidden tests by script, and of report claims blind to the arm by two reviewers with a recorded disagreement rule.
+- **Results** per model and per task, with raw counts, uncertainty, and null or negative findings.
+
+Until such results exist, describe unlazy as a discipline and a set of tools, not as a measured improvement.
+
 ## Repository-level validation
 
 The current implementation has a separate deterministic test suite for parser, checker, lease, hook, installer, and portability behavior. Run it with the repository's documented test command. Those software tests validate implementation behavior; they do not validate broad claims about model psychology or task productivity.

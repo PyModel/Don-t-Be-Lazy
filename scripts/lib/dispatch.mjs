@@ -2,21 +2,21 @@
 
 import { join, resolve } from "node:path";
 import {
-  appendStatus, readStableRegularFile, scopeRoot, validateScopeId, withFileLock, writeAtomic,
+  appendStatus, readLeases, readStableRegularFile, scopeHasLedger, scopeRoot, validateScopeId,
+  withFileLock, writeAtomic,
 } from "./gates.mjs";
+import { UNSAFE_TERMINAL_RE, singleLine } from "./terminal.mjs";
 
 const SCHEMA = 1;
 const MAX_STATE_BYTES = 8 * 1024 * 1024;
 const STATES = new Set(["open", "sealed", "complete", "abandoned"]);
-const CONTROL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/;
-const CONTROL_GLOBAL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g;
 
 const record = (value = {}) => Object.assign(Object.create(null), value);
 const emptyState = () => ({ schema: SCHEMA, waves: record() });
-const count = (record) => Object.keys(record).length;
+const count = (value) => Object.keys(value).length;
 
 function fail(message) { throw new Error(message); }
-const safeDiagnostic = (value) => String(value).replace(CONTROL_GLOBAL, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+const safeDiagnostic = (value) => singleLine(value, 500);
 
 function validId(value, label) {
   if (typeof value !== "string") fail(label + " must be a string");
@@ -28,7 +28,7 @@ function validId(value, label) {
 function validHandle(value) {
   if (typeof value !== "string") fail("handle must be a string");
   const handle = value.trim();
-  if (!handle || handle.length > 256 || CONTROL.test(handle)) {
+  if (!handle || handle.length > 256 || UNSAFE_TERMINAL_RE.test(handle)) {
     fail("handle must be printable, nonblank, and at most 256 characters");
   }
   return handle;
@@ -37,7 +37,7 @@ function validHandle(value) {
 function validReason(value) {
   if (typeof value !== "string") fail("reason must be a string");
   const reason = value.trim();
-  if (!reason || reason.length > 500 || CONTROL.test(reason)) {
+  if (!reason || reason.length > 500 || UNSAFE_TERMINAL_RE.test(reason)) {
     fail("reason must be printable, nonblank, and at most 500 characters");
   }
   return reason;
@@ -152,6 +152,15 @@ function validateState(state) {
   return state;
 }
 
+// The latest timestamp already recorded in a wave. Transitions never move
+// backwards even when the wall clock does.
+function latestTransition(wave) {
+  const times = [wave.openedAt, wave.sealedAt, wave.completedAt, wave.abandonedAt];
+  for (const start of Object.values(wave.started)) times.push(start.at);
+  for (const returned of Object.values(wave.returned)) times.push(returned.at);
+  return Math.max(...times.filter((value) => typeof value === "string").map((value) => Date.parse(value)));
+}
+
 function readState(root, path) {
   try {
     const text = readStableRegularFile(path, {
@@ -178,24 +187,25 @@ export function getDispatchWave(root, scope, waveId) {
   return state.waves[wave];
 }
 
-export function dispatchIssues(root, scope) {
-  return dispatchStatus(root, scope).blocking;
-}
-
+// Blocking waves are open ones: the launch barrier is incomplete. A sealed
+// wave has launched every leaf and waits for returns, which the host does in
+// the background, so it is `waiting` rather than blocking a Stop. The primary
+// gate reduction still counts both as unfinished.
 export function dispatchStatus(root, scope) {
-  if (!scope) return { blocking: [], abandoned: [], resolved: [], errors: [] };
+  if (!scope) return { blocking: [], waiting: [], abandoned: [], resolved: [], errors: [] };
   let state;
   try { state = readState(root, dispatchStatePath(root, scope)); }
   catch (error) {
     const message = safeDiagnostic(error.message);
     return {
       blocking: ["dispatch:PARSE invalid dispatch state"],
+      waiting: [],
       abandoned: [],
       resolved: ["dispatch:PARSE=invalid"],
       errors: ["invalid dispatch state for scope " + scope + ": " + message],
     };
   }
-  const result = { blocking: [], abandoned: [], resolved: [], errors: [] };
+  const result = { blocking: [], waiting: [], abandoned: [], resolved: [], errors: [] };
   for (const [id, wave] of Object.entries(state.waves).sort(([left], [right]) => left.localeCompare(right))) {
     const started = count(wave.started);
     const returned = count(wave.returned);
@@ -208,6 +218,7 @@ export function dispatchStatus(root, scope) {
       result.blocking.push("dispatch:" + id + " open (" + started + "/" + wave.leaves.length + " started)");
     } else {
       result.blocking.push("dispatch:" + id + " sealed (" + returned + "/" + wave.leaves.length + " returned)");
+      result.waiting.push("dispatch:" + id);
     }
   }
   return result;
@@ -217,15 +228,21 @@ export async function updateDispatch(root, spec) {
   const scope = validId(spec.scope, "scope");
   const waveId = validId(spec.wave, "wave");
   const path = dispatchStatePath(root, scope);
-  let event = "";
+  let logWarning = "";
 
   const wave = await withFileLock(root, path, () => {
     const state = readState(root, path);
-    const now = spec.now || new Date().toISOString();
-    validTime(now, "timestamp");
+    const requested = spec.now || new Date().toISOString();
+    validTime(requested, "timestamp");
+    let now = requested;
+    let event = "";
 
     if (spec.action === "open") {
       if (state.waves[waveId]) fail("wave " + waveId + " already exists");
+      // A typo in --scope must not create a second pipeline beside the real one.
+      if (!scopeHasLedger(root, scope)) {
+        fail("scope " + scope + " has no ledger under .unlazy/" + scope + "/; create its GATES.md or gates/*.md before opening a wave");
+      }
       const leaves = (spec.leaves || []).map((leaf) => validId(leaf, "leaf"));
       if (!leaves.length) fail("open requires at least one --leaf");
       const seen = new Set();
@@ -233,11 +250,19 @@ export async function updateDispatch(root, spec) {
         if (seen.has(leaf)) fail("duplicate leaf " + leaf);
         seen.add(leaf);
       }
+      const held = readLeases(root);
+      const unclaimed = leaves.filter((leaf) => !held.some((lease) => !lease.invalid && lease.scope === scope && lease.leaf === leaf));
+      if (unclaimed.length) {
+        fail("leaf " + unclaimed.join(", ") + " in scope " + scope + " holds no ownership lease; run gate-check.mjs --scope " +
+          scope + " --leaf <leaf> --claim for each before opening the wave");
+      }
       state.waves[waveId] = { leaves, state: "open", openedAt: now, started: record(), returned: record() };
       event = "dispatch " + waveId + " opened: " + leaves.join(", ");
     } else {
       const current = state.waves[waveId];
       if (!current) fail("unknown wave " + waveId);
+      const floor = latestTransition(current);
+      if (Date.parse(now) < floor) now = new Date(floor).toISOString();
       if (spec.action === "abandon") {
         if (current.state === "complete" || current.state === "abandoned") {
           fail("wave " + waveId + " is " + current.state + "; abandon requires an open or sealed wave");
@@ -279,15 +304,16 @@ export async function updateDispatch(root, spec) {
 
     validateState(state);
     writeAtomic(path, JSON.stringify(state, null, 2) + "\n", { root });
+    // Append under the same lock so the audit log orders events exactly as
+    // the committed transitions.
+    try {
+      appendStatus(root, scope, now + " " + event);
+    } catch (error) {
+      logWarning = "state transition committed; audit status append was skipped: " +
+        safeDiagnostic(error && error.message ? error.message : error);
+    }
     return state.waves[waveId];
   });
 
-  let logWarning = "";
-  try {
-    await appendStatus(root, scope, new Date().toISOString() + " " + event);
-  } catch (error) {
-    logWarning = "state transition committed; audit status append was skipped: " +
-      safeDiagnostic(error && error.message ? error.message : error);
-  }
   return { wave, logWarning };
 }

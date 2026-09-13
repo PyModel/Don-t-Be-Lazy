@@ -1,9 +1,9 @@
 # Gates: <branch name> integration
 
-Scope: integrate children <explicit child ids> into one verified result
+Summary: integrate children <explicit child ids> into one verified result
 
 - [ ] N1: every named direct child is reverified from its exact ledger
-  CHECK: node <skill-dir>/scripts/gate-check.mjs --root . --cwd . --reverify --jobs 1 .unlazy/<scope>/gates/leaf-<a>.md .unlazy/<scope>/gates/node-<b>.md
+  CHECK: node "<skill-dir>/scripts/gate-check.mjs" --root . --cwd . --reverify --jobs 1 .unlazy/<scope>/gates/leaf-<a>.md .unlazy/<scope>/gates/node-<b>.md
   EXPECT: ALL MET
   EVIDENCE: pending
 
@@ -29,13 +29,23 @@ Scope: integrate children <explicit child ids> into one verified result
   EVIDENCE: pending
 
 <!--
-Replace every placeholder before running the checker.
+Replace every placeholder before running the checker. Write <skill-dir> as the
+absolute path of the directory holding SKILL.md. That path is part of N1's
+definition digest and approval, so N1 is specific to this machine.
 
 N1 must name every direct child ledger explicitly, whether that child is a leaf
 or another branch, and use --reverify, not --status. Status validates the stored
-definition binding without executing or inspecting current artifacts. Keep --jobs 1 unless the child checks are independent and
-deterministic parallel execution is intentional.
-If a child reports an abandonment, N1 exits 1 with `HANDOFF REQUIRED`. Mark the
+definition binding without executing or inspecting current artifacts. Keep
+--jobs 1 unless the child checks are independent and deterministic parallel
+execution is intentional.
+
+Review and approve N1 after its children are verified. Its approval binds the
+bytes of the child ledgers it names, so a later child change needs a new N1
+token. N1 fails when a child oracle lacks approval under the same directory and
+PATH, because the nested checker exits 4; review that child with --review and
+approve its tokens first.
+
+If a child reports a handoff, N1 exits 1 with `HANDOFF REQUIRED`. Mark the
 branch ABANDONED and surface the handoff; never rewrite that result as completion.
 
 Branch paths use node-<id>.md. Leaf paths use leaf-<id>.md. Branch completion

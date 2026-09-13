@@ -15,6 +15,9 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
+import { automaticEvidencePrefix, gateDefinitionDigest, parseGates } from "../scripts/lib/gates.mjs";
+import { fileDigest } from "../scripts/lib/approval.mjs";
+import { requireFifo, runSuite, skip } from "./lib/harness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const LINT = join(HERE, "..", "scripts", "gate-lint.mjs");
@@ -142,7 +145,7 @@ test("lint: EXPECT passed as an argument is not guaranteed output", () => {
   EXPECT: VERIFY_OK
   EVIDENCE: pending
 `);
-  assert.doesNotMatch(lint(argument).out, /guarantees its own pass|expect-echoes-check/);
+  assert.doesNotMatch(lint(argument).out, /\[echoes-expect\]|\[masked-exit\]/);
 });
 
 test("lint: an expectation shared with failure output is warned", () => {
@@ -169,7 +172,7 @@ test("lint: shipped leaf and node templates satisfy the documented size policy",
   for (const name of ["gates-leaf.md", "gates-node.md"]) {
     const result = lint(join(HERE, "..", "templates", name));
     assert.equal(result.code, 0, result.out);
-    assert.doesNotMatch(result.out, /thin-ledger|fat-ledger|under five|over twelve/);
+    assert.doesNotMatch(result.out, /ERROR/);
   }
 });
 
@@ -180,7 +183,7 @@ test("lint: a sound ledger is clean and exits 0", () => {
 });
 
 test("lint: a symlink ledger is refused without changing its victim", () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const victim = write("symlink-victim.md", SOUND_BODY);
   const before = readFileSync(victim, "utf8");
   const alias = join(DIR, "symlink-ledger.md");
@@ -203,7 +206,7 @@ test("lint: a hard-linked ledger is refused without changing its victim", () => 
 });
 
 test("lint: a FIFO ledger is refused promptly instead of blocking", () => {
-  if (process.platform === "win32") return;
+  requireFifo();
   const fifo = join(DIR, "ledger.fifo");
   const made = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
   assert.equal(made.status, 0, made.stderr);
@@ -249,18 +252,20 @@ test("lint: json reports counts and stays parseable", () => {
 
 test("lint: default output escapes terminal and bidi controls in finding data", () => {
   const { out, code } = lint(TAINTED);
-  assert.equal(code, 0, out);
+  // Control characters inside ledger text are parse errors (exit 2): the
+  // diagnostic names the code point and the file name renders escaped.
+  assert.equal(code, 2, out);
   assertTerminalSafe(out);
+  assert.match(out, /U\+001B/);
   assert.match(out, /unsafe-\\u2028\\u2029\\u202e\.md/);
-  assert.match(out, /\\x1b\\x07\\x85\\u202e/);
-  assert.match(out, /^LINT OK \(\d+ warning\(s\)\)$/m);
+  assert.match(out, /^LINT FINDINGS:/m);
 });
 
 test("lint: JSON escapes terminal data while retaining pretty parseable output", () => {
   const { out, code } = lint("--json", TAINTED);
-  assert.equal(code, 0, out);
+  assert.equal(code, 2, out);
   assertTerminalSafe(out);
-  assert.match(out, /^\{\n  "ok": true,/);
+  assert.match(out, /^\{\n  "ok": false,/);
   const data = JSON.parse(out);
   assert.ok(data.findings.length > 0);
   assert.ok(data.findings.every((finding) => {
@@ -271,7 +276,7 @@ test("lint: JSON escapes terminal data while retaining pretty parseable output",
     return true;
   }));
   assert.ok(data.findings.some((finding) => finding.file.includes("\\u2028\\u2029\\u202e")));
-  assert.ok(data.findings.some((finding) => finding.message.includes("\\x1b\\x07\\x85\\u202e")));
+  assert.ok(data.findings.some((finding) => finding.message.includes("U+001B")));
 });
 
 test("CLI: unknown-option diagnostics escape terminal and bidi controls", () => {
@@ -285,7 +290,7 @@ test("lint: hostile field expansion stays bounded in text and JSON", () => {
   const large = write("large-controls.md", [
     "# Gates: bounded output",
     "",
-    "- [ ] G1: improve " + "\u001b".repeat(1024 * 1024) + " terminal output",
+    "- [ ] G1: improve " + "x".repeat(1024 * 1024) + " terminal output",
     "  EVIDENCE: pending",
     "",
   ].join("\n"));
@@ -375,24 +380,140 @@ test("lint: no arguments exits 2", () => {
   assert.equal(lint().code, 2);
 });
 
+// ------------------------------------------------------- rule coverage
+
+const ledger = (name, gates) => write(name, "# Gates: " + name + "\n\n" + gates.join("\n\n") + "\n");
+const ruleCount = (file, name) => (lint(file).out.match(new RegExp("\\[" + name + "\\]", "g")) || []).length;
+
+test("lint: masked exits are warned and honest chains are not", () => {
+  const masked = ledger("masked.md", [
+    "- [ ] G1: suite passes\n  CHECK: npm test || true\n  EXPECT: tests passed\n  EVIDENCE: pending",
+    "- [ ] G2: build succeeds\n  CHECK: node build.mjs; exit 0\n  EXPECT: build finished\n  EVIDENCE: pending",
+    "- [ ] G3: verifier passes\n  CHECK: node verify.mjs || echo verifier passed\n  EXPECT: verifier passed\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(masked, "masked-exit"), 3);
+  const honest = ledger("honest.md", [
+    "- [ ] G1: suite passes\n  CHECK: npm test && node report.mjs\n  EXPECT: tests passed\n  EVIDENCE: pending",
+    "- [ ] G2: logs are verified\n  CHECK: node check-true.mjs --mode=strict\n  EXPECT: logs verified\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(honest, "masked-exit"), 0);
+});
+
+test("lint: an EXPECT echoed after ; is warned while && and argv are not", () => {
+  const echoed = ledger("echoed.md", [
+    "- [ ] G1: verifier passes\n  CHECK: node verify.mjs; echo VERIFY_OK\n  EXPECT: VERIFY_OK\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(echoed, "echoes-expect"), 1);
+  const guarded = ledger("guarded.md", [
+    "- [ ] G1: verifier passes\n  CHECK: node verify.mjs && echo VERIFY_OK\n  EXPECT: VERIFY_OK\n  EVIDENCE: pending",
+    "- [ ] G2: verifier passes with argument\n  CHECK: node scripts/verify.mjs --expected VERIFY_OK\n  EXPECT: VERIFY_OK\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(guarded, "echoes-expect"), 0);
+});
+
+test("lint: a CHECK reading its own ledger is warned while the lint self-gate is not", () => {
+  const own = ledger("own.md", [
+    "- [ ] G1: every gate is checked\n  CHECK: node count-checked.mjs own.md\n  EXPECT: all gates checked\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(own, "reads-own-ledger"), 1);
+  const selfGate = ledger("self.md", [
+    "- [ ] G1: this ledger states outcomes that can fail\n  CHECK: node ../scripts/gate-lint.mjs --strict self.md\n  EXPECT: /^LINT OK$/m\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(selfGate, "reads-own-ledger"), 0);
+});
+
+test("lint: short and match-anything expectations are warned while decisive ones are not", () => {
+  const vague = ledger("vague.md", [
+    "- [ ] G1: build id is printed\n  CHECK: node build.mjs\n  EXPECT: A1\n  EVIDENCE: pending",
+    "- [ ] G2: any letters appear\n  CHECK: node build.mjs\n  EXPECT: /[a-z]+/i\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(vague, "short-expect"), 1);
+  assert.equal(ruleCount(vague, "match-anything"), 1);
+  const decisive = ledger("decisive.md", [
+    "- [ ] G1: build id is printed\n  CHECK: node build.mjs\n  EXPECT: BUILD_OK_7\n  EVIDENCE: pending",
+    "- [ ] G2: lint marker appears\n  CHECK: node lint.mjs\n  EXPECT: /^LINT OK$/m\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(decisive, "short-expect") + ruleCount(decisive, "match-anything"), 0);
+});
+
+test("lint: literal prints behind true, cmd, or node -e are tautologies while real checks are not", () => {
+  const literal = ledger("literal.md", [
+    "- [ ] G1: service is healthy\n  CHECK: true && echo healthy\n  EXPECT: healthy\n  EVIDENCE: pending",
+    "- [ ] G2: endpoints respond\n  CHECK: cmd /c echo 12 endpoints responded\n  EXPECT: 12 endpoints responded\n  EVIDENCE: pending",
+    "- [ ] G3: stat rows render\n  CHECK: node -e \"console.log('34 rows')\"\n  EXPECT: 34 rows\n  EVIDENCE: pending",
+    "- [ ] G4: e2e suite is green\n  CHECK: node -e \"process.stdout.write('e2e green')\"\n  EXPECT: e2e green\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(literal, "tautological-check"), 4);
+  const real = ledger("real-node.md", [
+    "- [ ] G1: marker file is read\n  CHECK: node -e \"console.log(require('fs').readFileSync('marker.txt','utf8'))\"\n  EXPECT: marker present\n  EVIDENCE: pending",
+    "- [ ] G2: suite passes\n  CHECK: true && npm test\n  EXPECT: tests passed\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(real, "tautological-check"), 0);
+});
+
+test("lint: a lint self-gate without --strict or an anchored marker is warned", () => {
+  const lenient = ledger("lenient.md", [
+    "- [ ] G1: this ledger states outcomes that can fail\n  CHECK: node ../scripts/gate-lint.mjs lenient.md\n  EXPECT: LINT OK\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(lenient, "lenient-lint-gate"), 1);
+  const exact = ledger("exact.md", [
+    "- [ ] G1: this ledger states outcomes that can fail\n  CHECK: node ../scripts/gate-lint.mjs --strict exact.md\n  EXPECT: LINT OK\n  EVIDENCE: pending",
+    "- [ ] G2: this ledger raises no warnings\n  CHECK: node ../scripts/gate-lint.mjs exact.md\n  EXPECT: /^LINT OK$/m\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(exact, "lenient-lint-gate"), 0);
+});
+
+test("lint: unreplaced template placeholders are warned", () => {
+  const templated = ledger("templated.md", [
+    "- [ ] G1: children reverify\n  CHECK: node <skill-dir>/scripts/gate-check.mjs --reverify leaf.md\n  EXPECT: ALL MET\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(templated, "unreplaced-placeholder"), 1);
+  const concrete = ledger("concrete.md", [
+    "- [ ] G1: children reverify\n  CHECK: node tools/unlazy/scripts/gate-check.mjs --reverify leaf.md\n  EXPECT: ALL MET\n  EVIDENCE: pending",
+  ]);
+  assert.equal(ruleCount(concrete, "unreplaced-placeholder"), 0);
+});
+
+test("lint: noun-led outcome titles and version numbers are not flagged", () => {
+  const nouns = ledger("nouns.md", [
+    "- [ ] G1: update log is written to disk\n  EVIDENCE: pending",
+    "- [ ] G2: support matrix covers Windows\n  EVIDENCE: pending",
+    "- [ ] G3: release v2.1.0 notes exist in sha256 order\n  EVIDENCE: pending",
+    "- [ ] G4: improve the retry logic\n  EVIDENCE: pending",
+    "- [ ] G5: dashboard renders 34 rows\n  EVIDENCE: pending",
+  ]);
+  const out = lint(nouns).out;
+  assert.equal((out.match(/\[activity-not-outcome\]/g) || []).length, 1, out);
+  assert.match(out, /G4: names an activity/);
+  assert.equal((out.match(/\[unmeasured-number\]/g) || []).length, 1, out);
+  assert.match(out, /G5: title states a number/);
+});
+
+test("lint: manual evidence without a location is warned", () => {
+  const manual = ledger("manual-evidence.md", [
+    "- [x] G1: copy reviewed\n  EVIDENCE: looks good to me",
+    "- [x] G2: copy reviewed again\n  EVIDENCE: reviewed docs/copy.md:12 against the brief",
+  ]);
+  const out = lint(manual).out;
+  assert.equal((out.match(/\[uncited-manual-evidence\]/g) || []).length, 1, out);
+  assert.match(out, /G1: manual evidence names no artifact location/);
+});
+
+test("lint: a script named in CHECK and edited after its evidence is warned", () => {
+  const script = write("verify-evidence.mjs", "console.log('VERIFY_OK');\n");
+  const gateText = "- [x] G1: verifier passes\n  CHECK: node verify-evidence.mjs\n  EXPECT: VERIFY_OK\n";
+  const parsed = parseGates(gateText + "  EVIDENCE: pending\n").gates[0];
+  const evidence = automaticEvidencePrefix(gateDefinitionDigest(parsed)) + " exit=0; EXPECT=matched; output-sha256=" +
+    "a".repeat(64) + "; output-bytes=10; shell=/bin/sh; cwd=.; path=abc/1 entries; inputs=verify-evidence.mjs@" +
+    fileDigest(readFileSync(script)).slice(0, 12);
+  const recorded = write("evidence-ledger.md", "# Gates\n\n" + gateText + "  EVIDENCE: " + evidence + "\n");
+  assert.equal(ruleCount(recorded, "input-changed-after-evidence"), 0);
+  writeFileSync(script, "console.log('VERIFY_OK'); process.exitCode = 0;\n");
+  assert.equal(ruleCount(recorded, "input-changed-after-evidence"), 1);
+});
+
 // ------------------------------------------------------------- runner
 
-const selected = tests.filter((t) => t.name.includes(filter));
-let passed = 0;
-const failures = [];
-
-for (const t of selected) {
-  try {
-    t.fn();
-    passed++;
-    console.log("ok   " + t.name);
-  } catch (e) {
-    failures.push(t.name);
-    console.log("FAIL " + t.name + "\n     " + String(e.message).split("\n").join("\n     "));
-  }
-}
-
-console.log("");
-console.log(passed + "/" + selected.length + " passed");
-try { rmSync(DIR, { recursive: true, force: true }); } catch { /* windows lag */ }
-process.exit(failures.length ? 1 : 0);
+const exitCode = await runSuite(tests, { filter });
+rmSync(DIR, { recursive: true, force: true });
+process.exit(exitCode);

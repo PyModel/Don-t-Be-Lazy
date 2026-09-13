@@ -10,7 +10,7 @@ The original v1 method claimed that each binary split multiplied effort. A small
 2. **Make each leaf one coherent deliverable.** Give it exact ownership, dependencies, and acceptance gates. Merge tiny adjacent leaves; split a leaf that hides several independent outcomes.
 3. **Fix contracts before fan-out.** Reread the original request and current amendments. Inventory every independently omittable required outcome and acceptance-changing constraint in `PLAN.md`, then record interfaces, formats, shared assumptions, error conventions, naming, and ownership before a leaf starts.
 4. **Give branches integration gates.** Verify child ledgers again, then test interfaces, end-to-end behavior, and regressions across the joined work.
-5. **Use gates and passes as the effort control.** Finish implementation, expert reread, defect hunt, and low-cost polish. Stop only when every required gate has current evidence and another improvement pass finds nothing.
+5. **Use gates and passes as the effort control.** Finish implementation, expert reread, review rounds, and low-cost polish, holding changed code to [engineering-standard.md](engineering-standard.md). End the review rounds at the limit that standard sets, and turn each item still open into an unmet gate, a handoff, or a Risks entry. Every leaf brief carries that standard, because a leaf on another host has not loaded `SKILL.md`.
 
 ## Choose depth
 
@@ -25,7 +25,7 @@ When no depth is requested, choose the smallest tree that exposes every independ
 
 Before dispatch, make these decisions explicit:
 
-- stable contract item ids mapped to an owner and observing gate or manual review
+- stable contract item ids mapped to an owner and observing gate or manual review, checked with `plan-check.mjs --require` over the ids from rereading the request
 - exact files or relative globs each leaf owns
 - interfaces and schemas shared between leaves
 - dependency ids and readiness states

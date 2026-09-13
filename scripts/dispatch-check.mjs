@@ -3,8 +3,10 @@
 
 import { resolve } from "node:path";
 import { getDispatchWave, updateDispatch } from "./lib/dispatch.mjs";
+import { escapeTerminal } from "./lib/terminal.mjs";
 
 const COMMANDS = new Set(["open", "start", "seal", "return", "abandon", "status"]);
+const OPTIONS = new Set(["--root", "--scope", "--wave", "--leaf", "--handle", "--reason"]);
 const args = process.argv.slice(2);
 
 function usage() {
@@ -16,38 +18,13 @@ function usage() {
     "  dispatch-check.mjs return --scope ID --wave ID --leaf ID [--root PATH]",
     "  dispatch-check.mjs abandon --scope ID --wave ID --reason TEXT [--root PATH]",
     "  dispatch-check.mjs status --scope ID --wave ID [--root PATH]",
+    "",
+    "Options accept --name VALUE or --name=VALUE. open requires the scope's ledger",
+    "and a claimed ownership lease for every leaf.",
   ].join("\n");
 }
 
-const UNSAFE_TERMINAL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/;
-const TRUNCATION_MARKER = "...[truncated]";
-function terminalSafe(value, maxBytes = 500) {
-  const pieces = [];
-  const sizes = [];
-  let bytes = 0;
-  let truncated = false;
-  for (const character of String(value)) {
-    let piece = character;
-    if (UNSAFE_TERMINAL.test(character)) {
-      const code = character.codePointAt(0);
-      piece = code <= 0xff
-        ? "\\x" + code.toString(16).padStart(2, "0")
-        : "\\u" + code.toString(16).padStart(4, "0");
-    }
-    const size = Buffer.byteLength(piece, "utf8");
-    if (bytes + size > maxBytes) { truncated = true; break; }
-    pieces.push(piece);
-    sizes.push(size);
-    bytes += size;
-  }
-  if (!truncated) return pieces.join("");
-  const markerBytes = Buffer.byteLength(TRUNCATION_MARKER, "utf8");
-  while (pieces.length && bytes + markerBytes > maxBytes) {
-    pieces.pop();
-    bytes -= sizes.pop();
-  }
-  return pieces.join("") + TRUNCATION_MARKER;
-}
+const terminalSafe = (value) => escapeTerminal(value, 500);
 
 function die(message, showUsage = false) {
   console.error("unlazy dispatch: " + terminalSafe(message));
@@ -66,10 +43,17 @@ if (!COMMANDS.has(command)) die("unknown command " + command, true);
 const options = { root: process.cwd(), scope: null, wave: null, leaves: [], handle: null, reason: null };
 const single = new Set();
 while (args.length) {
-  const option = args.shift();
-  if (!["--root", "--scope", "--wave", "--leaf", "--handle", "--reason"].includes(option)) die("unknown option " + option);
-  if (!args.length || args[0].startsWith("--")) die(option + " requires a value");
-  const value = args.shift();
+  const token = args.shift();
+  const equals = token.startsWith("--") ? token.indexOf("=") : -1;
+  const option = equals === -1 ? token : token.slice(0, equals);
+  if (!OPTIONS.has(option)) die("unknown option " + option);
+  let value;
+  if (equals !== -1) value = token.slice(equals + 1);
+  else {
+    if (!args.length || args[0].startsWith("--")) die(option + " requires a value");
+    value = args.shift();
+  }
+  if (value === "") die(option + " requires a value");
   if (option === "--leaf") options.leaves.push(value);
   else {
     if (single.has(option)) die(option + " may be provided only once");

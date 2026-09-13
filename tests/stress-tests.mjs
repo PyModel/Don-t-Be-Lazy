@@ -6,12 +6,13 @@ import {
   symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { execFile, spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
-  claimLeases, readStableRegularFile, releaseLeases, sha256, withFileLock, writeAtomic,
+  claimLeases, hookStatePath, readStableRegularFile, releaseLeases, sha256, withFileLock, writeAtomic,
 } from "../scripts/lib/gates.mjs";
+import { requireFifo, runNode, runSuite, skip } from "./lib/harness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GATE_CHECK = join(HERE, "..", "scripts", "gate-check.mjs");
@@ -20,10 +21,15 @@ const INSTALL = join(HERE, "..", "scripts", "install-hooks.mjs");
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
+const STATE_ROOT = mkdtempSync(join(tmpdir(), "unlazy-stress-state-"));
+const stateDirFor = (cwd) => join(STATE_ROOT, basename(cwd || "none"));
+
 function sandbox() {
   const dir = mkdtempSync(join(tmpdir(), "unlazy-stress-"));
+  const state = stateDirFor(dir);
   return {
     dir,
+    state,
     path(rel) { return join(dir, rel); },
     write(rel, value) {
       const path = join(dir, rel);
@@ -32,27 +38,24 @@ function sandbox() {
       return path;
     },
     read(rel) { return readFileSync(join(dir, rel), "utf8"); },
-    cleanup() { rmSync(dir, { recursive: true, force: true }); },
+    // The hook's per-session progress file inside this sandbox's state dir.
+    hookState(sessionId) {
+      const previous = process.env.UNLAZY_STATE_DIR;
+      process.env.UNLAZY_STATE_DIR = state;
+      try { return hookStatePath(sessionId); }
+      finally {
+        if (previous === undefined) delete process.env.UNLAZY_STATE_DIR;
+        else process.env.UNLAZY_STATE_DIR = previous;
+      }
+    },
+    cleanup() {
+      rmSync(dir, { recursive: true, force: true });
+    },
   };
 }
 
 function run(script, args, options = {}) {
-  return new Promise((done) => {
-    const child = execFile(process.execPath, [script, ...args], {
-      cwd: options.cwd,
-      encoding: "utf8",
-      maxBuffer: 8 * 1024 * 1024,
-      env: { ...process.env, ...(options.env || {}) },
-      timeout: options.timeoutMs,
-    }, (error, stdout, stderr) => {
-      done({
-        code: error ? (typeof error.code === "number" ? error.code : 1) : 0,
-        out: (stdout || "") + (stderr || ""),
-        timedOut: Boolean(error && error.killed),
-      });
-    });
-    if (options.stdin !== undefined) child.stdin.end(options.stdin);
-  });
+  return runNode(script, args, { ...options, env: { UNLAZY_STATE_DIR: stateDirFor(options.cwd), ...(options.env || {}) } });
 }
 
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
@@ -94,7 +97,7 @@ test("leases: the same scope and leaf cannot be claimed by two workers", async (
 });
 
 test("locks: real and symlink root aliases serialize one physical target", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   const outside = sandbox();
   try {
@@ -298,7 +301,7 @@ test("hook: repeated 64-writer bursts are serialized without lost increments", a
     s.write("GATES.md", "- [ ] G1: pending\n  EVIDENCE: pending\n");
     const payload = JSON.stringify({ cwd: s.dir, session_id: "one-session" });
     for (let round = 1; round <= 3; round++) {
-      rmSync(s.path(".unlazy-hook-state.json"), { force: true });
+      rmSync(s.hookState("one-session"), { force: true });
       const results = await Promise.all(Array.from({ length: 64 }, () =>
         run(STOP_HOOK, [], { cwd: s.dir, stdin: payload })));
       const crashed = results.filter((result) => result.code !== 0);
@@ -307,15 +310,13 @@ test("hook: repeated 64-writer bursts are serialized without lost increments", a
         [...new Set(crashed.map((result) => "exit=" + result.code + "\n" + result.out.trim()))]
           .slice(0, 4).join("\n---\n"));
       const failedUpdates = results
-        .filter((result) => result.out.includes("could not update the serialized hook state"))
+        .filter((result) => result.out.includes("progress state is unavailable") || result.out.includes("fell back"))
         .map((result) => result.out.trim());
       assert(failedUpdates.length === 0,
-        "round " + round + ": " + failedUpdates.length + " hook(s) failed open on the state update\n" +
+        "round " + round + ": " + failedUpdates.length + " hook(s) lost the primary state update\n" +
         [...new Set(failedUpdates)].slice(0, 4).join("\n---\n"));
-      const state = JSON.parse(s.read(".unlazy-hook-state.json"));
-      const sessions = Object.values(state.sessions);
-      assert(sessions.length === 1, "round " + round + ": expected one session, got " + sessions.length);
-      assert(sessions[0].blocks === 64, "round " + round + ": expected 64 blocks, got " + sessions[0].blocks);
+      const state = JSON.parse(readFileSync(s.hookState("one-session"), "utf8"));
+      assert(state.session.blocks === 64, "round " + round + ": expected 64 blocks, got " + state.session.blocks);
     }
   } finally { s.cleanup(); }
 });
@@ -328,23 +329,40 @@ test("hook: sessions remain isolated and completion/no-gates clears stale state"
       const payload = JSON.stringify({ cwd: s.dir, session_id: id });
       await Promise.all(Array.from({ length: 3 }, () => run(STOP_HOOK, [], { cwd: s.dir, stdin: payload })));
     }
-    let state = JSON.parse(s.read(".unlazy-hook-state.json"));
-    assert(Object.keys(state.sessions).length === 2, "sessions were mixed: " + JSON.stringify(state));
-    assert(Object.values(state.sessions).every((value) => value.blocks === 3), "session counters were not isolated");
+    for (const id of ["alpha", "beta"]) {
+      const state = JSON.parse(readFileSync(s.hookState(id), "utf8"));
+      assert(state.session.blocks === 3, id + " counter was not isolated: " + JSON.stringify(state));
+    }
 
-    s.write("GATES.md", "- [x] G1: done\n  EVIDENCE: measured\n");
+    s.write("GATES.md", "- [x] G1: done\n  EVIDENCE: measured in results.txt:1\n");
     await run(STOP_HOOK, [], { cwd: s.dir, stdin: JSON.stringify({ cwd: s.dir, session_id: "alpha" }) });
-    state = JSON.parse(s.read(".unlazy-hook-state.json"));
-    assert(Object.keys(state.sessions).length === 1, "completed alpha state was not cleared");
+    assert(!existsSync(s.hookState("alpha")), "completed alpha state was not cleared");
+    assert(existsSync(s.hookState("beta")), "beta state was cleared by alpha's completion");
 
+    // Deleting a ledger while beta remembers unmet gates is a bypass, not
+    // completion: the hook keeps blocking and keeps beta's state.
+    const betaPayload = JSON.stringify({ cwd: s.dir, session_id: "beta" });
     rmSync(s.path("GATES.md"));
-    await run(STOP_HOOK, [], { cwd: s.dir, stdin: JSON.stringify({ cwd: s.dir, session_id: "beta" }) });
-    assert(!existsSync(s.path(".unlazy-hook-state.json")), "no-gates path did not clear final state");
+    const deleted = await run(STOP_HOOK, [], { cwd: s.dir, stdin: betaPayload });
+    assert(/"decision":\s*"block"/.test(deleted.out) && deleted.out.includes("removed while gates were unmet"),
+      "deleting an unmet ledger was not blocked: " + deleted.out);
+    assert(existsSync(s.hookState("beta")), "beta state was cleared by deleting an unmet ledger");
+
+    // A remembered pipeline that ended in a handoff has nothing unmet, so the
+    // no-gates path clears the final state.
+    s.write("GATES.md", "- [ ] G1: pending\n  EVIDENCE: pending\n\nABANDON: G1 upstream removed\n");
+    await run(STOP_HOOK, [], { cwd: s.dir, stdin: betaPayload });
+    assert(existsSync(s.hookState("beta")), "handoff did not record beta state");
+    rmSync(s.path("GATES.md"));
+    const cleared = await run(STOP_HOOK, [], { cwd: s.dir, stdin: betaPayload });
+    assert(cleared.code === 0 && cleared.out === "", "no-gates path did not allow silently: " + cleared.out);
+    assert(!existsSync(s.hookState("beta")), "no-gates path did not clear final state");
+    assert(!existsSync(s.path(".unlazy-hook-state.json")), "hook wrote state into the repository");
   } finally { s.cleanup(); }
 });
 
 test("hook: a FIFO session binding is ignored promptly while a regular sibling binding resolves", async () => {
-  if (process.platform === "win32") return;
+  requireFifo();
   const s = sandbox();
   try {
     for (const scope of ["a", "b"]) {
@@ -379,7 +397,7 @@ test("hook: a FIFO session binding is ignored promptly while a regular sibling b
 });
 
 test("hook: absent pinned scopes allow while existing unsafe pinned scopes block", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   const outside = sandbox();
   try {
@@ -405,9 +423,10 @@ test("hook: absent pinned scopes allow while existing unsafe pinned scopes block
     const hook = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
     assert(hook.code === 0, "symlinked pinned scope hook process failed\n" + hook.out);
     has(hook.out, '"decision":"block"');
-    has(hook.out, "scope directory must be a real directory inside the repository");
+    // Repository-derived diagnostics reach the model only as counts.
+    has(hook.out, "discovery:PARSE (1 error(s))");
     assert(!hook.out.includes(canary), "hook read outside scope data\n" + hook.out);
-    assert(existsSync(s.path(".unlazy-hook-state.json")), "invalid scope did not use safe root hook state");
+    assert(existsSync(s.hookState("pinned-scope")), "invalid scope did not count toward the guard");
     for (const [index, file] of ["GATES.md", "dispatch.json", "hook-state.json"].entries()) {
       assert(outside.read(file) === before[index], "hook or checker changed outside " + file);
     }
@@ -421,7 +440,7 @@ test("hook: absent pinned scopes allow while existing unsafe pinned scopes block
 });
 
 test("hook: named special ledgers fail closed promptly instead of becoming no gates", async () => {
-  if (process.platform === "win32") return;
+  requireFifo();
   const s = sandbox();
   const outside = sandbox();
   try {
@@ -463,44 +482,59 @@ test("hook: named special ledgers fail closed promptly instead of becoming no ga
   }
 });
 
-test("hook: linked and FIFO progress state never blocks or changes a victim", async () => {
+test("hook: linked and FIFO progress state never changes a victim and the guard keeps counting", async () => {
   const s = sandbox();
   try {
     s.write("GATES.md", "# Gates\n- [ ] G1: pending\n  EVIDENCE: pending\n");
     const payload = JSON.stringify({ cwd: s.dir, session_id: "special-state" });
-    const statePath = s.path(".unlazy-hook-state.json");
-    const victim = s.write("state-victim.json", '{"schema":1,"sessions":{}}\n');
+    const statePath = s.hookState("special-state");
+    mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
+    const victim = s.write("state-victim.json", '{"schema":2,"session":{}}\n');
     const original = s.read("state-victim.json");
+    // The fallback lives under the hook's TMPDIR; keep it inside this sandbox.
+    const fallbackTmp = s.path("tmp");
+    mkdirSync(fallbackTmp, { recursive: true });
+    const env = { TMPDIR: fallbackTmp, TMP: fallbackTmp, TEMP: fallbackTmp };
+
+    const expectFallbackBlock = (result, label) => {
+      assert(result.code === 0, label + " hook process failed\n" + result.out);
+      has(result.out, '"decision":"block"');
+      has(result.out, "fell back to a temporary directory");
+      assert(s.read("state-victim.json") === original, "hook changed the " + label + " victim");
+    };
 
     linkSync(victim, statePath);
-    let result = await run(STOP_HOOK, [], { cwd: s.dir, stdin: payload, timeoutMs: 1500 });
-    assert(result.code === 0, "hard-linked hook state process failed\n" + result.out);
-    has(result.out, "could not update the serialized hook state");
-    assert(s.read("state-victim.json") === original, "hook changed the hard-link victim");
+    expectFallbackBlock(await run(STOP_HOOK, [], { cwd: s.dir, stdin: payload, timeoutMs: 5000, env }), "hard-linked");
     rmSync(statePath);
 
     if (process.platform !== "win32") {
       symlinkSync(victim, statePath);
-      result = await run(STOP_HOOK, [], { cwd: s.dir, stdin: payload, timeoutMs: 1500 });
-      assert(result.code === 0, "symlinked hook state process failed\n" + result.out);
-      has(result.out, "could not update the serialized hook state");
-      assert(s.read("state-victim.json") === original, "hook changed the symlink victim");
+      expectFallbackBlock(await run(STOP_HOOK, [], { cwd: s.dir, stdin: payload, timeoutMs: 5000, env }), "symlinked");
       rmSync(statePath);
 
       const made = spawnSync("mkfifo", [statePath], { encoding: "utf8" });
       assert(made.status === 0, "could not create hook-state FIFO: " + made.stderr);
       const started = Date.now();
-      result = await run(STOP_HOOK, [], { cwd: s.dir, stdin: payload, timeoutMs: 1500 });
-      assert(result.code === 0 && Date.now() - started < 1500,
-        "FIFO hook state did not fail promptly\n" + result.out);
-      has(result.out, "could not update the serialized hook state");
+      const fifo = await run(STOP_HOOK, [], { cwd: s.dir, stdin: payload, timeoutMs: 5000, env });
+      assert(Date.now() - started < 5000, "FIFO hook state did not fail promptly");
+      expectFallbackBlock(fifo, "FIFO");
       assert(lstatSync(statePath).isFIFO(), "hook replaced the FIFO state path");
+
+      // With both the primary and fallback stores unusable the hook allows the
+      // stop instead of wedging, and still names what remains unmet.
+      const blockedTmp = s.write("not-a-directory", "file\n");
+      const neither = await run(STOP_HOOK, [], {
+        cwd: s.dir, stdin: payload, timeoutMs: 5000, env: { TMPDIR: blockedTmp, TMP: blockedTmp, TEMP: blockedTmp },
+      });
+      assert(!neither.out.includes('"decision":"block"'), "unavailable state wedged Stop\n" + neither.out);
+      has(neither.out, "progress state is unavailable");
+      has(neither.out, "GATES:G1");
     }
   } finally { s.cleanup(); }
 });
 
 test("atomic writer: predictable pre-created temp links are never followed", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     s.write("victim.txt", "safe\n");
@@ -513,7 +547,7 @@ test("atomic writer: predictable pre-created temp links are never followed", asy
 });
 
 test("status log: an existing symlink is refused without touching its target", async () => {
-  if (process.platform === "win32") return;
+  if (process.platform === "win32") skip("POSIX only");
   const s = sandbox();
   try {
     s.write(".unlazy/api/GATES.md", "# Gates\n\n- [ ] G1: pending\n  EVIDENCE: pending\n");
@@ -540,7 +574,7 @@ test("status log: an existing hard link is refused without touching its sibling"
 });
 
 test("status log: a FIFO is rejected without blocking the logger", async () => {
-  if (process.platform === "win32") return;
+  requireFifo();
   const s = sandbox();
   try {
     s.write(".unlazy/api/GATES.md", "# Gates\n\n- [ ] G1: pending\n  EVIDENCE: pending\n");
@@ -578,7 +612,7 @@ test("installer: malformed settings shapes are refused without mutation", async 
 });
 
 test("installer: a FIFO settings target is rejected without blocking", async () => {
-  if (process.platform === "win32") return;
+  requireFifo();
   const s = sandbox();
   try {
     mkdirSync(s.path(".claude"), { recursive: true });
@@ -689,27 +723,13 @@ test("installer: scope input is validated and local state warning is explicit", 
     const good = await run(INSTALL, ["--scope", "api"], { cwd: s.dir });
     assert(good.code === 0, good.out);
     has(good.out, ".unlazy/");
-    has(good.out, ".unlazy-hook-state.json");
+    has(good.out, "hook-state");
     const settings = JSON.parse(s.read(".claude/settings.local.json"));
     const command = settings.hooks.Stop[0].hooks[0].command;
     has(command, "--scope api");
   } finally { s.cleanup(); }
 });
 
-let passed = 0;
-const failures = [];
-for (const item of tests) {
-  try {
-    await item.fn();
-    passed++;
-    console.log("ok   " + item.name);
-  } catch (error) {
-    failures.push(item.name);
-    console.log("FAIL " + item.name + "\n     " + String(error.message).replace(/\n/g, "\n     "));
-  }
-}
-console.log("\n" + passed + "/" + tests.length + " passed");
-if (failures.length) {
-  console.log("failed: " + failures.join(", "));
-  process.exit(1);
-}
+const exitCode = await runSuite(tests, { filter: process.argv[2] || "" });
+rmSync(STATE_ROOT, { recursive: true, force: true });
+process.exit(exitCode);

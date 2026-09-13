@@ -2,7 +2,7 @@
 
 OWNS: <repository-relative globs this leaf may write, for example src/api/**, tests/api/**>
 
-Scope: <one sentence describing the complete deliverable>
+Summary: <one sentence describing the complete deliverable>
 
 - [ ] G1: <observable outcome measured directly from the artifact>
   CHECK: node scripts/verify-outcome.mjs
@@ -21,31 +21,46 @@ Scope: <one sentence describing the complete deliverable>
 <!--
 Replace every placeholder before running the checker.
 
+Workflow, where <skill-dir> is the directory holding SKILL.md:
+- lint: node <skill-dir>/scripts/gate-lint.mjs --strict GATES.md
+- list each oracle and its token: node <skill-dir>/scripts/gate-check.mjs --review GATES.md
+- approve what you read, then run: node <skill-dir>/scripts/gate-check.mjs --approve=<tokens> GATES.md
+- before every report and commit: node <skill-dir>/scripts/gate-check.mjs --reverify GATES.md
+
 Strict format:
 - Use a unique explicit id for every gate.
-- Indent CHECK, EXPECT, CWD, and EVIDENCE.
+- Indent CHECK, EXPECT, CWD, and EVIDENCE directly under their gate, with no
+  blank line or prose in between.
 - Give a runnable gate both CHECK and EXPECT; give a manual gate neither.
 - Success requires process exit 0 and EXPECT.
-- Make EXPECT a success-only marker produced after every assertion passes.
+- Make EXPECT a success-only marker produced after every assertion passes, and
+  anchor a pattern to it, for example /^outcome verification passed$/m.
 - For an absence or negative assertion, test the same checker against a known
   positive fixture and record that control in the gate's manual review.
 - Measure supplied figures from source. Do not copy a supplied number into
   EXPECT as its own proof.
-- Use repository-owned Node scripts for portable examples. Declare any
-  non-default shell or external tool requirement explicitly.
+- Prefer the project's own test runner. Add a verifier script only when no
+  existing command observes the outcome, place it beside the project's tests,
+  and quote any path that contains spaces.
+- Declare any non-default shell or external tool requirement explicitly.
 - Scoped and legacy discovery anchor checks at the repository root. When this
   ledger is named explicitly from `.unlazy/`, pass an explicit repository
   `--root` and `--cwd` so repository-relative commands keep the same base.
-- Record exact manual evidence and review consequential manual gates by risk.
+- Record exact manual evidence that cites the artifact and location. A manual
+  gate you certify yourself is reported as self-certified.
 - OWNS paths must be repository-relative, complete, and disjoint from every
   concurrently dispatched leaf. Claims coordinate writers; they do not sandbox.
+- Keep a solo GATES.md untracked unless the user wants it committed.
 
-If a gate becomes genuinely impossible, keep the gate and add:
+If a gate cannot be finished, keep the gate and add one line at column 1:
 
 ```text
-ABANDON: G<n> <non-empty reason and handoff>
+ABANDON: G<n> <specific reason the outcome is impossible>
+ABANDON: G<n> DEFERRED: <what it waits on>
+ABANDON: G<n> OWNER_DECISION: <the question for the user>
 ```
 
-Surface every abandonment as a non-successful handoff in the final report; an
-abandoned leaf is not complete. See references/gates.md.
+Each is a non-successful handoff; surface it by id in the final report. Put an
+optional or out-of-scope edge case in the report's Risks section instead. See
+references/gates.md.
 -->

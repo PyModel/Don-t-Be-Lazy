@@ -1,35 +1,102 @@
 # Security model
 
-Unlazy executes repository-described checks. Its safety boundary is explicit review and approval, not command sandboxing.
+Unlazy runs commands that a repository describes. Its safety boundary is review and consent before execution, not command sandboxing, and that consent comes from whoever runs the checker: the operator or the agent. This file is the single source for what an approval binds.
 
 ## `CHECK:` lines are code
 
-`gate-check.mjs` runs each `CHECK:` through a shell with the checker's user permissions and inherited environment. A command can access files, network connections, credentials, and developer tools available to that process.
+`gate-check.mjs` runs each `CHECK:` through a shell with the checker's user permissions and inherited environment. A command can read and write files, open network connections, and use any credential or tool available to that process.
 
-Before using an inherited ledger:
+Before running an inherited ledger:
 
-1. Run `node <skill-dir>/scripts/gate-check.mjs --status <gate-file>` to parse and display status without executing checks.
-2. Read every `CHECK:`, `EXPECT:`, and `CWD:`. Inspect any script called by a check, including generated or ignored files.
-3. Determine the shell from `--shell`, `UNLAZY_SHELL`, or the platform default, and inspect the inherited `PATH`. For a new oracle with no exact approval, normal mode prints the resolved values without running it. Normal mode is not a universal dry run because an existing exact approval permits execution.
-4. Run with `--approve` only when the complete resolved oracle is expected and understood.
+1. Parse it without executing anything: `node <skill-dir>/scripts/gate-check.mjs --status <gate-file>`.
+2. List every oracle: `node <skill-dir>/scripts/gate-check.mjs --review <gate-file>`. Review prints each `CHECK:`, `EXPECT:`, resolved working directory, resolved shell, a `PATH` digest (`--show-path` lists every entry), the bound input files, and a 16-character token. It never executes and never writes.
+3. Read every command and every script it calls, including generated or ignored files.
+4. Approve only what you read: `node <skill-dir>/scripts/gate-check.mjs --approve=<tokens> <gate-file>`. The checker records those tokens and runs them. A bare `--approve`, a malformed token, or a token that matches no current oracle is refused with exit `2`.
 
-Approval records live under `~/.unlazy/approved` by default. `UNLAZY_APPROVAL_DIR` may select another directory only when it is a real, owner-private directory whose canonical target is outside the canonical repository root. The checker rejects symlinked stores and accepts a record only through a no-follow descriptor that still names the same owner-private, single-link regular file after reading. An approval is specific to the absolute ledger and gate, exact command and expectation, resolved working directory and shell, timeout, output and regex limits, regex startup/concurrency limits, platform, and full inherited `PATH`. A change to any bound input requires review and approval again. An approval is consent to execute; it is not evidence that the command matches the English gate title.
+A normal run never executes an oracle without an exact approval. It prints the same review block, leaves the command unexecuted, and exits `4`. Normal mode is not a dry run: once an oracle is approved, a normal run executes it.
 
-Approval does not snapshot files that a command invokes. If a referenced script, generated file, executable, fixture, or dependency changes while the approved command text remains the same, the old approval can still authorize the changed bytes. Inspect those dependencies again before running the command. Automatic ledger evidence carries a separate environment-independent digest of parsed `CHECK:`, `EXPECT:`, and raw `CWD:`; `--status` and the Stop hook reject stale or unbound definitions without executing, but neither revalidates artifacts. The digest is unkeyed and therefore detects definition drift rather than authenticating a result against a ledger editor. Run `--reverify` after dependency or input changes. When a workflow needs machine-enforced dependency currentness, put the expected dependency digests directly in approval-bound `CHECK:` text and validate them with a separately trusted tool or runtime. That remains user-designed coverage, not transitive tracing by unlazy.
+Who may approve is an instruction, not a mechanism. `SKILL.md` lets an agent approve oracles it wrote in the current session and requires the user's explicit approval for an inherited ledger. Nothing in the checker can tell those cases apart.
 
-Approval and lease locks fail closed instead of being stolen automatically. If an owning process terminates unexpectedly, verify the PID recorded in that specific lock is no longer running and that no operation can still own it before removing the abandoned lock manually. Do not bulk-delete lock directories while unlazy is active.
+Do not run untrusted checks to learn what they do. Review them as source first, and use a disposable environment or a stronger sandbox when source trust is uncertain.
 
-Do not run untrusted checks merely to learn what they do. Review them as source first. Use a disposable environment or stronger sandbox when source trust is uncertain.
+## What an approval binds
+
+An approval is keyed to the absolute ledger path and the gate id, plus this runtime oracle:
+
+- the exact `CHECK:` and `EXPECT:` text
+- the resolved working directory, plus the device and inode of that directory and of the ledger's directory, so a directory replaced at the same path, or a different clone at the same path, needs approval again
+- the resolved shell
+- the timeout, the output limit, the regular-expression match and worker-startup limits, and the regular-expression worker count
+- the platform
+- the full inherited `PATH`, in order
+- the SHA-256 of each regular repository file named directly in `CHECK:`, up to 16 files
+
+A named file is a quoted or bare `CHECK:` word that contains a path separator or ends in a script extension, carries no shell expansion characters, and resolves to a single-link regular file inside the repository. Files under generated or dependency directories (`node_modules`, `dist`, `build`, `out`, `target`, `coverage`, `.next`, `.nuxt`, `.cache`, `vendor`, `.venv`, `venv`, `__pycache__`) stay unbound because they change without review. The `INPUTS:` line of `--review` shows exactly which files are bound.
+
+A change to any bound value produces a new token. When the store holds an approval for the same ledger gate, the review names the fields that differ from the closest one, so a reordered `PATH` or an edited verifier is visible instead of looking like a new oracle.
+
+An approval does not bind:
+
+- files that a named script imports, reads, or executes, or that the command reaches through a shell expansion
+- tools found on `PATH`, environment variables other than `PATH`, dependencies, and network services
+- the meaning of the gate: an approval is consent to execute, not evidence that the command measures the English outcome
+
+Reinspect changed transitive inputs and run `--reverify`. When a workflow needs machine-enforced identity for them, put expected digests in the `CHECK:` text and validate them with a separately trusted tool.
+
+Automatic evidence carries a separate, environment-independent digest of the parsed `CHECK:`, `EXPECT:`, and raw `CWD:`. `--status` and the Stop hook use it to mark evidence stale when the definition changes, without executing anything. The digest is unkeyed: it detects drift, not tampering.
+
+## Approval store
+
+Approvals live in `~/.unlazy/approved`. `UNLAZY_STATE_DIR` moves the `~/.unlazy` base, and `UNLAZY_APPROVAL_DIR` selects the store directly. The store must be a real, owner-private directory whose canonical path is outside every repository whose ledgers it authorizes, so a repository cannot ship its own approvals. A store that group or others can access fails with the `chmod 700` command that fixes it. A record is accepted only as an owner-private, single-link regular file, read through a no-follow descriptor that still names the same file after reading.
+
+Manage the store by token:
+
+- `--list-approvals` lists each record with its state, gate, approval time, and ledger.
+- `--revoke <tokens>` deletes the named records.
+- `--prune-approvals` deletes corrupt and outdated records and records whose ledger no longer exists.
+
+Records are unkeyed JSON with no expiry. Any process running as the same user, including an agent, can write one.
+
+Approval and lease locks fail closed instead of being broken automatically. If an owning process dies, confirm that the PID recorded in that specific lock is no longer running and that no operation can still own it, then remove only that lock. Do not bulk-delete lock directories while unlazy is active.
+
+## What unlazy cannot stop
+
+- **Ledger edits.** Anyone who can edit a ledger can mark a manual gate `[x]` with invented evidence, forge a canonical automatic-evidence line, or rewrite a gate so it proves less. A rewritten runnable gate needs a new approval, but approving the weaker oracle is one more token.
+- **Self-approval.** An agent can approve its own tokens or write an approval record directly. The approval rule in `SKILL.md` is an instruction.
+- **Sessions the hook does not see.** The Stop hook runs only on Claude Code where it is installed, gates only the main session because no SubagentStop handler is installed, and releases after six blocks without progress. A new session starts with no memory of an earlier one.
+- **Designed fail-open paths.** The hook allows with a diagnostic when its input is not a JSON object, when the installed `--scope` is invalid or names a scope that no longer exists, and when progress state cannot be written in either store. A pipeline with unmet work and no bound session blocks once to deliver its binding notice, then allows. Each path exists so a broken configuration cannot trap a session.
+- **Transitive inputs** described above, and any outcome that a passing oracle does not measure.
+
+Within one session the hook does remember what it saw. A ledger with unmet gates that disappears, and a runnable gate rewritten as manual, both keep blocking until they are restored, handed off with a reason, or released by the no-progress guard.
+
+## Threats and status
+
+| Threat | Status | Mitigation or reason |
+|---|---|---|
+| Hostile `CHECK:` in an inherited ledger | Mitigated, relies on review | Nothing runs without approval of the exact oracle; review shows the resolved command and bound inputs |
+| Oracle or named verifier changed after approval | Mitigated | Every bound field, including named file bytes, changes the token |
+| Transitive input changed after approval | Open | Not traced; reinspect and run `--reverify` |
+| Repository ships its own approvals | Mitigated | The store must be owner-private and outside the repository |
+| Same-user process forges an approval, evidence, or hook state | Accepted | Records and state are unkeyed; unlazy holds no secret to sign with |
+| Ledger or dispatch text injected into the model through the hook | Mitigated | The block reason carries counts, qualified ids, and fixed wording; unsafe ledger names become a hash, free-form reasons are never copied, and messages are capped |
+| Hook fails open | Accepted | Listed above; the alternative traps sessions |
+| Skill supply chain: an install follows a live checkout | Open, warned | The installer warns about uncommitted changes, an untagged checkout, and a version-managed Node; pin installs to a tag or a dedicated worktree |
+| Windows timeout leaves a detached grandchild | Accepted | `taskkill /T` ends the tree it can see; a process that left that tree can outlive the timeout |
+| Short successful output guessed from its digest | Accepted | Evidence stores a SHA-256 of output; do not print secrets or low-entropy sensitive values |
+| Several operating-system users share one pipeline | Unsupported | State, lock, and approval directories are owner-private |
+| Stale lock after a crash | Accepted | Locks are never broken automatically; recover by hand as described above |
 
 ## Shell and environment
 
-Shell resolution follows `--shell`, then `UNLAZY_SHELL`, then Node's platform default. The child inherits the current environment, including `PATH`. Changing the terminal used to launch unlazy can change which external tools resolve, especially on Windows.
+Shell resolution follows `--shell`, then `UNLAZY_SHELL`, then Node's platform default. A bare `--shell` name resolves only through absolute `PATH` entries. The child inherits the whole environment, including `PATH`, so the terminal that launches unlazy can change which tools resolve, especially on Windows.
 
-Prefer repository-owned Node scripts and explicit `CWD:` values. A shell override does not install missing utilities, clean the environment, or restrict command access. The execution transcript shows the resolved `PATH`, capped for display. Persisted evidence includes resolved shell, working directory, exit status, a short `PATH` fingerprint, the match result, and a SHA-256/byte-count fingerprint of the exact canonical string supplied to `EXPECT:`. Both the raw stdout/stderr payload and that string's UTF-8 representation must fit the 1 MiB limit; invalid-byte replacement and the synthetic inter-stream newline count toward the latter, and an overflow is rejected before matching rather than truncated. Raw successful output is not echoed or written to the ledger. Failure diagnostics remain console-only, bounded, and stripped of terminal control, Unicode line-separator, and bidirectional-override characters. Gate-lint also caps each rendered field and the number of returned findings after escaping, while preserving full counts and exit semantics.
+Prefer the project's test runner or repository-owned scripts, and repository-relative `CWD:` values. A shell override does not install utilities, clean the environment, or restrict access.
 
-Regular-expression expectations run in at most four disposable workers. A separate five-second worker-startup limit applies before the 250ms match budget begins, so high `--jobs` concurrency cannot consume the backtracking budget merely by delaying worker startup. A timed-out worker is terminated and cannot certify a gate.
+Persisted evidence contains the definition digest, the exit status, the match result, a SHA-256 and byte count of the exact string matched by `EXPECT:`, the resolved shell, the working directory relative to the repository, a `PATH` digest and entry count, and the digest of each bound input. Raw successful output is never written. Both the raw stdout and stderr payload and the combined matcher string must fit within 1 MiB; an overflow fails instead of being truncated. Failure diagnostics stay in the terminal, bounded and stripped of terminal controls, line separators, and bidirectional overrides.
 
-See [references/gates.md](references/gates.md) for the full shell and success contract.
+Regular-expression expectations run in at most four disposable workers. Each worker gets a five-second startup limit before its separate 250ms match budget, so high `--jobs` values cannot spend the match budget on startup. A timed-out worker is terminated and cannot certify a gate.
+
+See [references/gates.md](references/gates.md) for the full success contract.
 
 ## Scopes and leases are not a sandbox
 
@@ -39,33 +106,55 @@ Separate worktrees can reduce ordinary path contention, but they may still share
 
 ## Stop hook and local state
 
-The optional Claude Code Stop hook scans ledgers and dispatch state, then writes progress state. It does not execute `CHECK:` commands, resolve the runtime approval oracle, inspect approval storage, revalidate transitive artifacts, or create agent sessions. It does validate the same pure automatic-evidence definition digest as `--status`. It emits Claude Code's documented top-level block decision while the resolved session pipeline has unmet gates or incomplete dispatch waves and releases after unlazy's own six no-progress blocks. Gate or dispatch abandonment is non-successful handoff state: Stop preserves a bounded `HANDOFF REQUIRED` system message in pure, mixed-blocking, and release outcomes. Repository-derived diagnostics are control-stripped and capped, and free-form abandonment reasons are never copied into the privileged message.
+The optional Claude Code Stop hook reads ledgers and dispatch state and writes one progress file per session. It never executes `CHECK:` commands, resolves an approval oracle, reads the approval store, or creates agent sessions. It validates the same definition digest as `--status`.
 
-Runtime, binding, dispatch, and append-only audit files live under `.unlazy/` in scoped mode. Legacy mode may use `.unlazy-hook-state.json`. Ledger, binding, lease, dispatch, and hook-state reads are bounded and require an unchanged regular single-link file; repository-discovered inputs must also remain within the canonical repository root. Named invalid inputs fail closed instead of disappearing as an empty pipeline, including a pinned scope whose named entry exists but is linked, special, unreadable, or outside the root; only a physically absent stale scope may use the hook's nonblocking fallback. Nonblocking opens keep FIFOs from wedging the checker or hook. State writes reject symlink directories and targets; status append also rejects multi-link files and verifies that its opened descriptor still names the same single-link regular file before writing.
+Progress state lives in `~/.unlazy/hook-state/`, or under `UNLAZY_STATE_DIR` when set, in a file named by a hash of the session id. When that store is unusable, the hook falls back to an owner-private `unlazy-hook-<uid>` directory under the system temporary directory and says so in its message. Stale state files are pruned. The hook writes nothing into the repository. Scoped pipelines keep their bindings, dispatch state, status log, and locks under `.unlazy/`, which should stay untracked.
 
-On Windows, named-entry `lstat` remains the type/symlink/link-count guard, while same-file decisions compare strict BigInt `dev` plus `ino` from the original descriptor and a second non-creating descriptor opened from the current name. Bracketing named-entry snapshots, a precise inode bridge, and repeated descriptor snapshots make ordinary link and replacement races fail closed without comparing the affected path-stat `dev` to descriptor-stat `dev`. These are snapshot checks, not atomic path isolation. An adversary who can rename or redirect the Windows path during the checks could present one cross-volume, same-inode target to both opens while both `lstat` calls observe the original, or replace the name after its final snapshot; Node 16 exposes neither a Windows no-follow open nor native handle-to-name/volume primitives to close those races without a native dependency. Unix retains `O_NOFOLLOW` and its existing descriptor-to-path checks. Node/libuv's exposed `st_dev`/`st_ino` abstraction can also be weaker than a native volume GUID plus 128-bit file ID; BigInt preserves every exposed bit but cannot recover identifiers the runtime does not expose. Keep both paths in the project's ignore rules. Session ids in bindings and native agent ids in dispatch waves are routing values, not secrets or authentication tokens.
+The hook blocks while a pipeline it enforces has unmet gates, an invalid ledger, or a dispatch wave that has not sealed. It enforces the project's `GATES.md`, the scope pinned at install, and any scope bound to the current session, found from the session's current directory, `CLAUDE_PROJECT_DIR`, and the nearest ancestor that holds unlazy state. A scope with unmet work and no bound session blocks once per session to deliver a notice with the exact `--bind` command, and then allows. A handoff blocks once, so the report lists it, and later stops are allowed. Repository-derived text reaches the model only as counts, qualified ids, and fixed wording, and every message is capped.
 
-Each check runs beneath a detached Node supervisor that remains the process-group leader until the shell and every inherited stdout/stderr descriptor close. POSIX group cleanup is attempted only while that exact supervisor is still observed live; after exit, its numeric PID/PGID is never signalled because it may have been reused. On Windows timeout cleanup, unlazy accepts only the drive-root `<drive>:\Windows\System32\taskkill.exe` when the host-provided `SystemRoot`, `WINDIR`, and `SystemDrive` values agree; arbitrary, missing, or inconsistent roots are rejected, and it never searches the check's current directory or `PATH`. These launcher environment values are a consistency boundary, not cryptographic proof of OS identity. If the location cannot be established, cleanup falls back to the already-held child handle and the checker still settles on its own bounded timer. A successful signal request is not treated as proof of process exit.
+Ledger, binding, lease, dispatch, and hook-state reads are bounded and require an unchanged regular single-link file. Repository-discovered inputs must stay inside the canonical repository root. A named invalid input fails closed instead of disappearing as an empty pipeline, including a pinned scope whose entry exists but is linked, special, unreadable, or outside the root; only a physically absent pinned scope takes the nonblocking path. Nonblocking opens keep FIFOs from wedging the checker or hook. State writes reject symlinked directories and targets, and the status-log append also rejects multi-link files and confirms that its descriptor still names the same file before writing.
+
+### File identity on Windows
+
+On Windows, named-entry `lstat` remains the type, symlink, and link-count guard, while same-file decisions compare BigInt `dev` plus `ino` from the original descriptor and from a second non-creating descriptor opened by name. Bracketing snapshots make ordinary link and replacement races fail closed.
+
+These are snapshot checks, not atomic path isolation. An adversary who can rename or redirect the path during the checks could present one cross-volume target with the same inode to both opens, or replace the name after the final snapshot. Node 16 exposes neither a Windows no-follow open nor handle-to-path primitives that would close those races without a native dependency. Unix keeps `O_NOFOLLOW` and its descriptor-to-path checks.
+
+Node's exposed `st_dev` and `st_ino` can be weaker than a native volume GUID plus a 128-bit file id. BigInt keeps every exposed bit but cannot recover bits the runtime does not expose.
+
+Session ids in bindings and agent handles in dispatch waves are routing values, not secrets or credentials.
+
+### Process cleanup
+
+Each check runs beneath a detached Node supervisor that stays the process-group leader until the shell and every inherited output descriptor close. POSIX group cleanup is attempted only while that exact supervisor is still observed alive; after it exits, its numeric PID and PGID are never signalled, because they may have been reused.
+
+On a Windows timeout, unlazy runs only the drive-root `<drive>:\Windows\System32\taskkill.exe`, and only when `SystemRoot`, `WINDIR`, and `SystemDrive` agree; it never searches the check's directory or `PATH`. Those variables are a consistency check, not proof of operating-system identity. If the helper cannot be located, cleanup falls back to the child handle, and the checker still settles on its own timer. A successful signal request is not treated as proof of exit.
+
+On SIGHUP, SIGINT, or SIGTERM, the checker stops running checks, keeps the results that already finished, and exits `129`, `130`, or `143`.
 
 ## Installer targets and privacy
 
-The installer changes Claude Code settings only after explicit invocation:
+The installer changes Claude Code settings only when invoked:
 
-- Default: `.claude/settings.local.json` in the current project
+- default: `.claude/settings.local.json` in the current project
 - `--global`: the current user's Claude Code settings
 - `--shared`: `.claude/settings.json` in the project
 
-The installed hook command contains the absolute Node executable and the absolute path to this copy of `stop-hook.mjs`. Those paths can expose local directory names. They also make `--shared` non-portable unless every collaborator has matching paths. Prefer the default local target and keep `.claude/settings.local.json` in the project's ignore rules. Review the diff before committing any Claude settings file.
+The installed command holds the absolute Node executable and the path to `stop-hook.mjs` exactly as the installer was invoked, so a symlinked skill directory stays a link. At every Stop the hook runs whatever that directory holds, including uncommitted edits on whatever branch is checked out. The installer warns when Node comes from a version manager, when the skill checkout has uncommitted changes, and when it is not at a tagged release. If the Node binary or the script disappears, Claude Code treats the failing hook as non-blocking and enforcement stops without notice; run `install-hooks.mjs --verify` after upgrading Node or moving the skill.
 
-Install and uninstall preserve unrelated hooks. New handlers carry an exact managed marker; legacy handlers are recognized only by an exact old marker/path shape, never a substring in an unrelated command. The installer opens existing settings without following links, verifies that the descriptor still names the same single-link regular file, and refuses malformed or unsupported settings shapes instead of replacing them. It writes atomically and creates `<settings-file>.unlazy.bak` beside an existing settings file before replacement.
+These paths can reveal local directory names, and they make `--shared` non-portable. Prefer the default local target, keep `.claude/settings.local.json` untracked, and review the diff before committing any Claude settings file.
+
+Install and uninstall preserve unrelated hooks. New handlers carry an exact managed marker; legacy handlers are recognized only by an exact old marker and path shape, never by a substring of an unrelated command. The installer follows a symlinked settings file to its target, opens that target without following further links, verifies that the descriptor still names the same single-link regular file, and refuses malformed settings shapes. It writes atomically and keeps the first `<settings-file>.unlazy.bak` it creates, so the backup stays the file as it was before unlazy.
 
 ## Evidence and logs
 
-Command output can contain private paths or other sensitive text. Successful output is consumed only for matching and then represented by a digest and byte count; it is not copied into terminal success lines or gate evidence. Failure diagnostics are still visible in the local terminal, so checks must not emit secrets on either path. Dispatch state contains timestamps and opaque host handles. Never put prompts, credentials, or result bodies in a handle. Design checks to emit a concise success marker and avoid printing secrets. Review ledgers, dispatch state, and status logs before committing or sharing them.
+Command output can contain private paths or other sensitive text. Successful output is used only for matching and is then represented by a digest and byte count. Failure diagnostics are visible in the local terminal, so checks must not print secrets on either path. Evidence records the working directory relative to the repository, but the shell path and bound input names can still reveal local layout. Review ledgers, dispatch state, and status logs before committing or sharing them.
 
-A sealed wave proves only that the host returned a distinct native start handle for every declared leaf before Unlazy accepted a return. It does not prove exact CPU overlap, worker honesty, filesystem isolation, successful gates, or correct integration. `dispatch.json` is the transition authority; `status.log` is a later audit append. If that append is refused after a committed transition, the command succeeds with a bounded warning so callers inspect state instead of blindly replaying the transition.
+A sealed wave records only that the driver wrote a distinct handle string for every declared leaf before a return was accepted. Unlazy cannot confirm a handle with the host: an invented handle, or a hand-written complete wave in `dispatch.json`, passes, and handles are compared only within one wave. A sealed wave proves nothing about CPU overlap, worker honesty, isolation, gates, or integration. Never put prompts, credentials, or result bodies in a handle.
 
-Unlazy does not intentionally collect telemetry or send approval, gate, or hook-state records to a service. A `CHECK:` command can perform its own network or logging activity because it is arbitrary code.
+`dispatch.json` is the transition authority, and `status.log` is a later audit append. If that append is refused after a committed transition, the command succeeds with a bounded warning so callers inspect state instead of replaying the transition.
+
+Unlazy collects no telemetry and sends no approval, gate, or hook-state record to any service. A `CHECK:` command can perform its own network or logging activity because it is arbitrary code.
 
 ## Reporting a vulnerability
 

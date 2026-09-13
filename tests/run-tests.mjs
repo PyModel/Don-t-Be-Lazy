@@ -8,11 +8,11 @@
 // Prints "N/N passed" on success, which is the string CI and the repo's own
 // gates match on.
 
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
-import { execFile } from "node:child_process";
-import { join, dirname } from "node:path";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { basename, join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { reviewAndRun, runNode, runSuite } from "./lib/harness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GATE_CHECK = join(HERE, "..", "scripts", "gate-check.mjs");
@@ -20,6 +20,16 @@ const STOP_HOOK = join(HERE, "..", "scripts", "stop-hook.mjs");
 const INSTALL = join(HERE, "..", "scripts", "install-hooks.mjs");
 const filter = process.argv[2] || "";
 const APPROVAL_ROOT = mkdtempSync(join(tmpdir(), "unlazy-test-approvals-"));
+const STATE_ROOT = mkdtempSync(join(tmpdir(), "unlazy-test-state-"));
+// Each sandbox gets its own per-user state directory, so hook counters never
+// bleed between tests that share a session id.
+const stateDirFor = (cwd) => join(STATE_ROOT, basename(cwd || "none"));
+const hookSessions = (cwd) => {
+  const directory = join(stateDirFor(cwd), "hook-state");
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory).filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(readFileSync(join(directory, name), "utf8")).session);
+};
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -42,18 +52,14 @@ function sandbox() {
 }
 
 function run(script, args, opts = {}) {
-  return new Promise((res) => {
-    const actions = new Set(["--status", "--claim", "--release", "--list-scopes", "--log", "--bind", "--help", "-h"]);
-    const needsApproval = script === GATE_CHECK && !opts.noApprove && !args.some((arg) => actions.has(arg));
-    const actualArgs = needsApproval && !args.includes("--approve") ? ["--approve", ...args] : args;
-    const child = execFile(process.execPath, [script, ...actualArgs], {
-      cwd: opts.cwd, encoding: "utf8", maxBuffer: 8 * 1024 * 1024,
-      env: { ...process.env, UNLAZY_APPROVAL_DIR: APPROVAL_ROOT, ...(opts.env || {}) },
-    }, (err, stdout, stderr) => {
-      res({ code: err ? (err.code ?? 1) : 0, out: (stdout || "") + (stderr || "") });
-    });
-    if (opts.stdin !== undefined) { child.stdin.end(opts.stdin); }
-  });
+  const options = {
+    cwd: opts.cwd,
+    stdin: opts.stdin,
+    env: { UNLAZY_APPROVAL_DIR: APPROVAL_ROOT, UNLAZY_STATE_DIR: stateDirFor(opts.cwd), ...(opts.env || {}) },
+  };
+  return script === GATE_CHECK && !opts.noApprove
+    ? reviewAndRun(script, args, options)
+    : runNode(script, args, options);
 }
 
 const gate = (id, title, check, expect) =>
@@ -268,11 +274,17 @@ test("run: a concurrent edit to another gate in the same file survives", async (
     // evidence filled in by hand while that check is still running.
     s.write("GATES.md",
       "# Gates\n\n" +
-      "- [ ] G1: slow\n  CHECK: " + nodeEval("setTimeout(()=>console.log('SLOW-OK'),2500)") +
+      "- [ ] G1: slow\n  CHECK: " + nodeEval("require('fs').writeFileSync('started.txt','1');setTimeout(()=>console.log('SLOW-OK'),2500)") +
       "\n  EXPECT: SLOW-OK\n  EVIDENCE: pending\n\n" +
       "- [ ] G2: manual\n  EVIDENCE: pending\n");
     const running = run(GATE_CHECK, [], { cwd: s.dir });
-    await new Promise(r => setTimeout(r, 800));
+    // Edit only after the check has started, so the writeback must merge a
+    // concurrent change instead of racing a fixed delay.
+    const started = join(s.dir, "started.txt");
+    for (const deadline = Date.now() + 20000; !existsSync(started);) {
+      if (Date.now() > deadline) throw new Error("the slow check never started");
+      await new Promise(r => setTimeout(r, 20));
+    }
     const text = s.read("GATES.md")
       .replace("- [ ] G2: manual\n  EVIDENCE: pending", "- [x] G2: manual\n  EVIDENCE: measured 47 rows, threadAnalysis.ts:88");
     s.write("GATES.md", text);
@@ -418,8 +430,8 @@ test("hook: stale definition evidence blocks repeated ids without executing and 
       staleBytes.replace("CHECK: node ./b.mjs", "CHECK: node ././b.mjs"));
     const secondHook = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
     assertHas(secondHook.out, '"decision":"block"');
-    const hookState = JSON.parse(s.read(".unlazy/api/hook-state.json"));
-    assert(Object.values(hookState.sessions)[0].blocks === 2,
+    const hookState = hookSessions(s.dir);
+    assert(hookState.length === 1 && hookState[0].blocks === 2,
       "stale definition edit reset semantic progress: " + JSON.stringify(hookState));
 
     const repaired = await run(GATE_CHECK, ["--scope", "api"], { cwd: s.dir });
@@ -427,8 +439,8 @@ test("hook: stale definition evidence blocks repeated ids without executing and 
     assertHas(repaired.out, "PASS leaf-stale:G1");
     const allowed = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
     assertLacks(allowed.out, '"decision":"block"', "repaired Stop hook");
-    assert(!existsSync(join(s.dir, ".unlazy", "api", "hook-state.json")),
-      "completed scope retained stale hook progress state");
+    assert(hookSessions(s.dir).length === 0, "completed scope retained stale hook progress state");
+    assert(!existsSync(join(s.dir, ".unlazy", "api", "hook-state.json")), "hook wrote progress state into the repository");
   } finally { s.cleanup(); }
 });
 
@@ -468,7 +480,7 @@ test("hook: a matching digest with a malformed success transcript stays unmet", 
   } finally { s.cleanup(); }
 });
 
-test("hook: abandonment allows Stop but reports an explicit bounded handoff", async () => {
+test("hook: abandonment blocks once with an explicit bounded handoff, then allows Stop", async () => {
   const s = sandbox();
   try {
     s.write(".unlazy/api/gates/leaf-7.md", [
@@ -480,25 +492,48 @@ test("hook: abandonment allows Stop but reports an explicit bounded handoff", as
       "ABANDON: G3 secret-looking reason that must stay ledger-local",
       "",
     ].join("\n"));
-    const r = await run(STOP_HOOK, ["--scope", "api"], {
-      cwd: s.dir,
-      stdin: JSON.stringify({ cwd: s.dir, session_id: "handoff-test" }),
-    });
-    assertLacks(r.out, '"decision":"block"');
-    assertHas(r.out, "HANDOFF REQUIRED");
-    assertHas(r.out, "leaf-7:G3");
-    assertLacks(r.out, "secret-looking reason");
+    const stdin = JSON.stringify({ cwd: s.dir, session_id: "handoff-test" });
+    // The block reason is the channel the model is documented to receive, so
+    // the handoff is delivered there once; the next Stop is allowed.
+    const first = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    assertHas(first.out, '"decision":"block"');
+    assertHas(first.out, "HANDOFF REQUIRED");
+    assertHas(first.out, "leaf-7:G3");
+    assertLacks(first.out, "secret-looking reason");
+    const second = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
+    assertLacks(second.out, '"decision":"block"');
+    assertHas(second.out, "HANDOFF REQUIRED");
+    assertLacks(second.out, "secret-looking reason");
   } finally { s.cleanup(); }
 });
 
-test("hook: unresolvable scope allows the stop instead of blocking blindly", async () => {
+test("hook: unbound pipelines get one bind notice naming the session, then Stop is allowed", async () => {
   const s = sandbox();
   try {
     s.write(".unlazy/api/gates/leaf-1.md", "# Gates\n\n" + gate("G1", "a", null, null));
     s.write(".unlazy/web/gates/leaf-1.md", "# Gates\n\n" + gate("G1", "b", null, null));
-    const r = await run(STOP_HOOK, [], { cwd: s.dir, stdin: JSON.stringify({ cwd: s.dir }) });
-    assertLacks(r.out, '"decision":"block"', "hook");
-    assertHas(r.out, "2 pipelines");
+    const stdin = JSON.stringify({ cwd: s.dir, session_id: "sess-notice" });
+    const first = await run(STOP_HOOK, [], { cwd: s.dir, stdin });
+    assertHas(first.out, '"decision":"block"', "first hook");
+    assertHas(first.out, "no bound session");
+    assertHas(first.out, "--scope api --bind sess-notice");
+    assertHas(first.out, "--scope web --bind sess-notice");
+    const second = await run(STOP_HOOK, [], { cwd: s.dir, stdin });
+    assertLacks(second.out, '"decision":"block"', "second hook");
+    const other = await run(STOP_HOOK, [], { cwd: s.dir, stdin: JSON.stringify({ cwd: s.dir, session_id: "other-session" }) });
+    assertHas(other.out, '"decision":"block"', "a different session gets its own notice");
+  } finally { s.cleanup(); }
+});
+
+test("hook: a single unbound pipeline does not silently capture an unrelated session", async () => {
+  const s = sandbox();
+  try {
+    s.write(".unlazy/api/gates/leaf-1.md", "# Gates\n\n" + gate("G1", "a", null, null));
+    s.write(".unlazy/api/session", "owner-session\n");
+    const r = await run(STOP_HOOK, [], { cwd: s.dir, stdin: JSON.stringify({ cwd: s.dir, session_id: "someone-else" }) });
+    assertLacks(r.out, '"decision":"block"', "a pipeline bound to another session");
+    const owner = await run(STOP_HOOK, [], { cwd: s.dir, stdin: JSON.stringify({ cwd: s.dir, session_id: "owner-session" }) });
+    assertHas(owner.out, '"decision":"block"', "the bound owner");
   } finally { s.cleanup(); }
 });
 
@@ -522,9 +557,8 @@ test("hook: each pipeline keeps its own loop-guard counter", async () => {
     s.write(".unlazy/web/gates/leaf-1.md", "# Gates\n\n" + gate("G1", "b", null, null));
     const stdin = JSON.stringify({ cwd: s.dir });
     for (let i = 0; i < 7; i++) await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
-    const apiState = JSON.parse(s.read(".unlazy/api/hook-state.json"));
-    const apiSession = Object.values(apiState.sessions)[0];
-    assert(apiSession.blocks === 7, "api counter should be 7, got " + apiSession.blocks);
+    const [apiSession] = hookSessions(s.dir);
+    assert(apiSession && apiSession.blocks === 7, "api counter should be 7, got " + JSON.stringify(apiSession));
     // api has exhausted its guard and now releases; web is untouched and still blocks.
     const apiNow = await run(STOP_HOOK, ["--scope", "api"], { cwd: s.dir, stdin });
     assertHas(apiNow.out, "releasing after 6 blocks");
@@ -638,22 +672,7 @@ test("install: an upstream v2.0 entry is still recognised and removable", async 
 
 // ---------------------------------------------------------------- driver
 
-const selected = tests.filter(t => t.name.includes(filter));
-let passed = 0;
-const failures = [];
-
-for (const t of selected) {
-  try {
-    await t.fn();
-    passed++;
-    console.log("ok   " + t.name);
-  } catch (e) {
-    failures.push({ name: t.name, err: e });
-    console.log("FAIL " + t.name + "\n     " + String(e.message).split("\n").join("\n     "));
-  }
-}
-
-console.log("");
-console.log(passed + "/" + selected.length + " passed");
-try { rmSync(APPROVAL_ROOT, { recursive: true, force: true }); } catch { /* best effort */ }
-process.exit(failures.length ? 1 : 0);
+const exitCode = await runSuite(tests, { filter });
+rmSync(APPROVAL_ROOT, { recursive: true, force: true });
+rmSync(STATE_ROOT, { recursive: true, force: true });
+process.exit(exitCode);

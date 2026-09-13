@@ -41,6 +41,8 @@ mechanical.
 
 Do not save time by skipping approval, negative controls, parent re-verification, or integration gates. Those checks exist because a fast false completion costs more than a direct failure.
 
+Task scale sets how much ledger to write. It does not change what `references/engineering-standard.md` requires of the code the task changes: a skipped failure-path test or unvalidated input boundary inside scope is deferred cost, not a saving.
+
 Do not orchestrate a task that one focused session can implement and verify cleanly. Conversely, do not keep an entire build in one context merely to avoid subagent overhead when independent leaves and contracts are clear.
 
 ## Measurement claims
